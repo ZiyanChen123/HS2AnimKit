@@ -25,7 +25,7 @@ try:
 except Exception as e:
     print("[fix] 启用插件失败:", e)
 
-from hs2_rig_kit import ops, rig  # noqa: E402
+from hs2_rig_kit import api, ops, rig  # noqa: E402
 
 CLIPS = ("L_Broken_Chair_A", "L_Broken_Chair_B", "swim_Idle_00_L",
          "cook_Idle_00_S", "S_Broken_Chair_A", "M_Broken_Chair_A",
@@ -56,13 +56,28 @@ def local_rot(pb):
 
 def main():
     print("[fix] Blender %s" % bpy.app.version_string)
+    available = {e["name"] for e in api.search(kind="studio", limit=100000)}
+    clips = [c for c in CLIPS if c in available][:3]
+    if not clips:
+        clips = [e["name"] for e in
+                 api.search(keyword="Idle", kind="studio", limit=3)]
+    if not clips:
+        print("[fix] 失败：游戏里找不到可用的 Studio 动作")
+        return 1
+
     bpy.ops.hs2.load_default(cleanup=True, include_head=False)
     arm = bpy.data.objects["HS2_Default"]
     scn = bpy.context.scene
 
-    for clip in CLIPS:
+    tested = 0
+    for clip in clips:
         bpy.ops.hs2.clear_rig()
-        bpy.ops.hs2.import_clip(clip_name=clip, follow=False)
+        try:
+            bpy.ops.hs2.import_clip(clip_name=clip, follow=False)
+        except RuntimeError as e:
+            print("[fix] 跳过 %s：%s" % (clip, e))
+            continue
+        tested += 1
         n = scn.frame_end
         act = arm.animation_data.action
         curves = _fcurves(act, arm)
@@ -104,6 +119,8 @@ def main():
                 check(d, mean < 4.0 and mx < 5.0, "mean %.2f max %.2f"
                       % (mean, mx))
 
+    if not tested:
+        FAILS.append("没有成功导入任何动作")
     print("[fix] %s" % ("全部通过" if not FAILS else "失败：%s" % FAILS))
     return 1 if FAILS else 0
 

@@ -138,6 +138,62 @@ class _Sampler(object):
 
 
 # --------------------------------------------------------------------------
+# 两条动作之间的混合（复现 Unity 的 1D blend tree）
+# --------------------------------------------------------------------------
+
+def _slerp(qa, qb, t):
+    d = sum(a * b for a, b in zip(qa, qb))
+    if d < 0.0:
+        qb = [-c for c in qb]
+        d = -d
+    if d > 0.9995:
+        return list(qa)
+    import math
+    th0 = math.acos(max(-1.0, min(1.0, d)))
+    th = th0 * t
+    s0 = math.sin(th0 - th) / math.sin(th0)
+    s1 = math.sin(th) / math.sin(th0)
+    return [qa[i] * s0 + qb[i] * s1 for i in range(4)]
+
+
+def blend(a, b, t):
+    """把两条动作按 t 混成一条（0=a，1=b）。
+
+    游戏里的身高就是这样处理的：S/M/L 三段是同一个动作的三个体型版本，
+    播放时用 Unity 的 1D 混合树按 height 参数连续插值。这里照做，
+    所以拖身高滑条时手和胯的位置是平滑对位的，不会在 S/M/L 之间跳。
+    """
+    t = max(0.0, min(1.0, float(t)))
+    if t <= 1e-6:
+        return a
+    if t >= 1.0 - 1e-6:
+        return b
+    tracks = {}
+    for path in set(a.tracks) | set(b.tracks):
+        ta, tb = a.tracks.get(path) or {}, b.tracks.get(path) or {}
+        out = {}
+        for ch in ("pos", "scale"):
+            va, vb = ta.get(ch), tb.get(ch)
+            if va and vb:
+                n = min(len(va), len(vb))
+                out[ch] = [[round(va[i][k] + (vb[i][k] - va[i][k]) * t, 5)
+                            for k in range(3)] for i in range(n)]
+            elif va or vb:
+                out[ch] = va or vb
+        qa, qb = ta.get("rot"), tb.get("rot")
+        if qa and qb:
+            n = min(len(qa), len(qb))
+            out["rot"] = [[round(c, 6) for c in _slerp(qa[i], qb[i], t)]
+                          for i in range(n)]
+        elif qa or qb:
+            out["rot"] = qa or qb
+        if out:
+            tracks[path] = out
+    return ClipData("%s~%s" % (a.name, b.name), a.fps,
+                    max(a.duration, b.duration), tracks, dict(a.stats))
+
+
+# --------------------------------------------------------------------------
 # 主入口
 # --------------------------------------------------------------------------
 

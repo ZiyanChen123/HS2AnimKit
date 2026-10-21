@@ -5,6 +5,7 @@ __pycache__/
 # 本机逆向/参考/测试素材，不发布（含他人版权素材与反编译代码）
 _ref/
 _test/
+_cache_test/
 _backup/
 MikuMikuRig-main/
 
@@ -13,7 +14,10 @@ HS2RigKit_addon.zip
 *.fbx
 *.vmd
 Stomp.fbx
+tools/_studio_info.json
 
 # 编辑器
 .vscode/
 .idea/
+# Agent 工作区（记忆/会话）
+.workbuddy/

@@ -1,5 +1,5 @@
 ﻿import os, zipfile
-root=r'D:\game\HS2\HS2AnimKit'
+root=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 src=os.path.join(root,'hs2_rig_kit')
 out=os.path.join(root,'HS2RigKit_addon.zip')
 with zipfile.ZipFile(out,'w',zipfile.ZIP_DEFLATED,compresslevel=9) as z:

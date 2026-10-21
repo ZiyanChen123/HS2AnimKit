@@ -1,9 +1,17 @@
-"""侧栏面板。
+"""侧栏面板（v4：动作驱动）。
 
-布局原则：
-1. 主面板只放「一次性的准备工作」——游戏目录、加载角色、状态、IK 状态；
-2. 「动作库 / 控制器 / 输出」三个子面板按使用顺序排；
-3. 开关一律用真正的勾选框/滑块（不是一次性按钮），状态一眼可见。
+之前的模型是「先放角色，再选动作装到某个角色身上」，要维护谁是谁、几个槽，
+用户根本不该关心这些。现在反过来：
+
+    **动作才是主角。点一条动作 → 演员和道具自己进场；换一条 → 清场重装。**
+
+演员的个数和性别由动作决定（工作室动作 1 个，H 单人 1 个、百合 2 女、3P 3 人），
+用户不用知道「女1/女2/男1」这些东西 —— 它们只在内部用来对齐数据。
+
+面板只有三个：
+    动作   ← 选什么就演什么
+    调整   ← IK / 一键处理 / 手势
+    外部动作 ← VMD、Mixamo、手动放人（另一种用法，收起）
 """
 
 import os
@@ -13,44 +21,141 @@ import bpy
 from . import ops, rig
 
 
+# --------------------------------------------------------------------------
+# 小工具
+# --------------------------------------------------------------------------
+
 def _arm(context):
     return ops.current_arm()
 
 
-def _stamp():
-    """插件代号 + 所在目录。用来确认 Blender 跑的到底是哪一份代码。"""
-    import sys
-
-    from . import bl_info
-    mod = sys.modules.get(__package__)
-    f = getattr(mod, "__file__", None) or ""
-    full = os.path.dirname(os.path.dirname(os.path.abspath(f))) if f else ""
-    parts = full.replace("\\", "/").rstrip("/").split("/")
-    short = "/".join(parts[-2:]) if len(parts) >= 2 else full
-    v = ".".join(str(x) for x in bl_info.get("version", (0,)))
-    return "v%s · …/%s" % (v, short), full
-
-
 def _safe(fn):
-    """draw 出错时不要留白，把异常显示在面板上并打印到控制台。"""
     def wrap(self, context):
         try:
             fn(self, context)
         except Exception as e:
             import traceback
             traceback.print_exc()
-            self.layout.label(text="HS2 面板出错：%s" % e, icon="ERROR")
+            self.layout.label(text="面板出错：%s" % e, icon="ERROR")
     return wrap
 
 
-def _pref_bool(prefs, name, default):
-    return getattr(prefs, name, default) if prefs else default
+def _right(layout):
+    r = layout.row(align=True)
+    r.alignment = "RIGHT"
+    return r
 
 
-# ==========================================================================
+def draw_variant_selector(layout, context):
+    """身高/胸围档位：跟「编辑对象」放一起，只有当前动作真有变体才显示。"""
+    try:
+        from . import ops, ops2
+        from .ripper import hdb
+        scn = context.scene
+        if getattr(scn, "hs2_tab", "STUDIO") == "STUDIO":
+            i = scn.hs2_studio_index
+            items = scn.hs2_studio_items
+            if not (0 <= i < len(items)):
+                return
+            base = items[i].value
+            hv = ops._studio_variant_map(context).get(base)
+            if not hv:
+                return
+            prop = "hs2_studio_height"
+            label = "身高档位"
+            count = len(hv[1])
+        else:
+            _m, _stage, g = ops2._current_group(context)
+            if g is None:
+                return
+            variants = hdb.group_variants(g)
+            if not variants:
+                return
+            prop = "hs2_h_variant"
+            label = "胸围档位" if g.get("kind") == "bust" else "身高档位"
+            count = len(variants)
+        row = layout.row(align=True)
+        row.label(text="%s（%d 档）" % (label, count),
+                  icon="ARMATURE_DATA")
+        row.prop(scn, prop, text="")
+    except Exception:
+        return
+
+
+def draw_actor_selector(layout, context):
+    """在「调整」顶部放一排演员按钮：点哪个，下面所有工具就编辑哪个。
+
+    H 动作多人的时候，手势 / IK / 动作后处理都只对当前选中的演员生效。
+    按钮只显示槽位名（女1/男1/女2/男2），多人也放得下。
+    3 人以上用 grid_flow 避免按钮溢出侧栏。
+    """
+    from . import api
+    chars = api.characters()
+    if not chars:
+        box = layout.box()
+        draw_variant_selector(box, context)
+        return
+    box = layout.box()
+    box.label(text="编辑对象（点切换）", icon="ARMATURE_DATA")
+    n = len(chars)
+    if n >= 3:
+        grid = box.grid_flow(row_major=True, columns=n, align=True)
+        container = grid
+    else:
+        container = box.row(align=True)
+    active = api.active_character()
+    for slot in sorted(chars, key=lambda s: (s[0] != "f", s)):
+        ch = chars[slot]
+        label = api.SLOT_CN.get(slot, slot)
+        btn = container.operator("hs2.select_char", text=label,
+                                 emboss=True, depress=(ch is active))
+        btn.name = ch.name
+    if active is not None:
+        slot = tuple(k for k, v in chars.items() if v is active)
+        slot = slot[0] if slot else ""
+        label = api.SLOT_CN.get(slot, slot) if slot else active.name
+        row = box.row(align=True)
+        row.label(text="当前：%s" % label, icon="RESTRICT_SELECT_OFF")
+    draw_variant_selector(box, context)
+
+
+# --------------------------------------------------------------------------
+# 列表（数据由 ops2 在面板外面维护，draw 只画）
+# --------------------------------------------------------------------------
+
+class HS2_UL_studio(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data,
+                  active_propname, index):
+        row = layout.row(align=True)
+        row.label(text=item.label, icon="ACTION")
+        if item.sub:
+            _right(row).label(text=item.sub)
+
+
+class HS2_UL_h(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data,
+                  active_propname, index):
+        row = layout.row(align=True)
+        row.label(text=item.label, icon="IMPORT")
+        if item.sub:
+            _right(row).label(text=item.sub)
+
+
+class HS2_UL_stage(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data,
+                  active_propname, index):
+        row = layout.row(align=True)
+        row.label(text=item.label, icon="KEYFRAME")
+        if item.sub:
+            _right(row).label(text=item.sub)
+
+
+# --------------------------------------------------------------------------
+# 动作（主面板）
+# --------------------------------------------------------------------------
 
 class HS2_PT_main(bpy.types.Panel):
-    bl_label = "HS2 动画工具"
+    bl_label = "动作"
     bl_idname = "HS2_PT_main"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -61,91 +166,97 @@ class HS2_PT_main(bpy.types.Panel):
         layout = self.layout
         scn = context.scene
         prefs = ops.addon_prefs(context)
+        from . import api, ops2
 
-        # ---- 版本 / 路径（确认跑的是哪份代码）----
-        try:
-            text, _p = _stamp()
+        if not api.game_dir():
             row = layout.row(align=True)
-            row.label(text=text, icon="SCRIPT")
-            # 重载插件：注销旧面板/属性 → 重载模块 → 重新注册。
-            # （script.reload 只重载模块不重新注册面板，改了 UI 看不出来）
-            row.operator("hs2.reload", text="", icon="FILE_REFRESH")
-        except Exception:
-            pass
-
-        # ---- 游戏目录 ----
-        box = layout.box()
-        row = box.row(align=True)
-        row.label(text="游戏目录", icon="FILE_FOLDER")
-        row.operator("hs2.detect_dir", text="", icon="VIEWZOOM")
-        if prefs:
-            box.prop(prefs, "game_dir", text="")
-        if prefs and not prefs.game_dir:
-            box.label(text="没设置过就点右边的放大镜", icon="INFO")
-
-        # ---- 加载角色 ----
-        col = layout.column(align=True)
-        col.scale_y = 1.25
-        op = col.operator("hs2.load_default", text="加载默认角色",
-                          icon="ARMATURE_DATA")
-        op.include_head = _pref_bool(prefs, "include_head", True)
-        op.cleanup = True
-
-        arm = _arm(context)
-        if arm is None:
-            layout.label(text="还没有骨架", icon="INFO")
+            if prefs:
+                row.prop(prefs, "game_dir", text="")
+            row.operator("hs2.detect_dir", text="", icon="VIEWZOOM")
+            layout.label(text="先选 HS2 游戏目录（abdata 的上一级）", icon="ERROR")
             return
 
-        # ---- 状态 ----
-        box = layout.box()
-        col = box.column(align=True)
-        col.label(text=arm.name, icon="OUTLINER_OB_ARMATURE")
-        col.label(text="骨架 %d 骨 · 变形 %d" % (len(arm.data.bones),
-                                                len(rig.deform_bone_names(arm))))
-        body = bpy.data.objects.get(ops.BODY_NAME)
-        head = bpy.data.objects.get(ops.HEAD_NAME)
-        row = col.row(align=True)
-        row.label(text="身体 %s" % (len(body.data.vertices) if body else "—"))
-        row.label(text="头部 %s" % (len(head.data.vertices) if head else "—"))
-        if head is None:
-            col.operator("hs2.add_head", icon="ADD", text="补头部")
+        layout.prop(scn, "hs2_tab", expand=True)
 
-        # ---- IK / 关节校正状态 ----
-        if rig.has_rig(arm):
-            on = rig.ik_state(arm)
-            row = layout.row(align=True)
-            row.label(text="IK %s" % ("开" if on else "关（纯 FK）"),
-                      icon="CONSTRAINT")
-            row.label(text="开关在下方「控制器」面板", icon="INFO")
+        if scn.hs2_tab == "STUDIO":
+            self.draw_studio(context, layout, scn, api, ops2)
         else:
-            layout.label(text="下一步：动作库选动作 → 控制器生成", icon="INFO")
-        if hasattr(arm, "hs2_jointfix"):
-            row = layout.row(align=True)
-            row.label(text="关节校正 %s" % ("开" if arm.hs2_jointfix else "关"),
-                      icon="MODIFIER")
-            row.prop(arm, "hs2_jointfix", text="", toggle=True)
+            self.draw_h(context, layout, scn, api, ops2)
 
-        # ---- 工作室手势（21 种）----
+        last = scn.hs2_last or ""
+        if last:
+            layout.label(text="正在演：%s" % last, icon="CHECKMARK")
+
+    # ---- 工作室动作 ----
+    def draw_studio(self, context, layout, scn, api, ops2):
+        if ops2.scanning():
+            self.draw_scanning(layout)
+            return
+        n = len(scn.hs2_studio_items)
+        if n == 0:
+            self.draw_empty(layout, api)
+            return
+
+        row = layout.row(align=True)
+        row.prop(scn, "hs2_clip_filter", text="", icon="VIEWZOOM")
+        row.prop(scn, "hs2_clip_cat", text="")
+        row.prop(scn, "hs2_clip_sub", text="")
+
+        layout.template_list("HS2_UL_studio", "", scn, "hs2_studio_items",
+                             scn, "hs2_studio_index", rows=13)
+
+        row = layout.row(align=True)
+        row.label(text="%d 个 · 点一行就演" % n, icon="NONE")
+        op = row.operator("hs2.scan_clips", text="", icon="FILE_REFRESH")
+        op.rebuild = True
+
+    # ---- H 动作 ----
+    def draw_h(self, context, layout, scn, api, ops2):
+        if ops2.scanning():
+            self.draw_scanning(layout)
+            return
+        if not len(scn.hs2_h_items):
+            self.draw_empty(layout, api)
+            return
+
+        row = layout.row(align=True)
+        row.prop(scn, "hs2_h_cast", text="")
+        row.prop(scn, "hs2_h_filter", text="", icon="VIEWZOOM")
+        row.prop(scn, "hs2_h_props", text="", icon="MESH_DATA")
+
+        layout.template_list("HS2_UL_h", "", scn, "hs2_h_items",
+                             scn, "hs2_h_index", rows=10)
+
+        if len(scn.hs2_stage_items):
+            layout.label(text="阶段（直接切，演员不动）", icon="KEYFRAME")
+            layout.template_list("HS2_UL_stage", "", scn, "hs2_stage_items",
+                                 scn, "hs2_stage_index", rows=7)
+
+    # ---- 状态提示 ----
+    def draw_scanning(self, layout):
         box = layout.box()
-        box.label(text="工作室手势（21 种，直接写手指骨）", icon="HAND")
-        row = box.row(align=True)
-        row.prop(scn, "hs2_hand_L", text="左手")
-        row = box.row(align=True)
-        row.prop(scn, "hs2_hand_R", text="右手")
-        row = box.row(align=True)
-        op = row.operator("hs2.apply_hand_pose", text="写入关键帧", icon="KEYINGSET")
-        op.mode = "BOTH"
-        op.keyframe = scn.hs2_hand_key
-        op = row.operator("hs2.apply_hand_pose", text="还原", icon="LOOP_BACK")
-        op.mode = "RESET"
-        box.label(text="下拉即预览；「写入关键帧」把当前选择写进选中帧",
-                  icon="INFO")
-        box.prop(scn, "hs2_hand_key", text="写入时在当前帧打关键帧")
+        box.label(text="正在建立动作库索引…", icon="TIME")
+        box.label(text="第一次大约 30 秒，之后秒开", icon="NONE")
+
+    def draw_empty(self, layout, api):
+        box = layout.box()
+        if not api.game_dir():
+            box.label(text="没找到游戏目录", icon="ERROR")
+            return
+        box.label(text="还没读到动作", icon="INFO")
+        op = box.operator("hs2.scan_clips", text="现在建索引",
+                          icon="FILE_REFRESH")
+        op.rebuild = True
+        box.label(text="一般不用点：第一次用会自己建", icon="NONE")
 
 
-class HS2_PT_anim(bpy.types.Panel):
-    bl_label = "动作库"
-    bl_idname = "HS2_PT_anim"
+# --------------------------------------------------------------------------
+# 调整
+# --------------------------------------------------------------------------
+
+class HS2_PT_edit(bpy.types.Panel):
+    bl_label = "调整"
+    bl_idname = "HS2_PT_edit"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "HS2"
@@ -155,170 +266,172 @@ class HS2_PT_anim(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         scn = context.scene
-        names = ops.clip_list(context)
+        from . import api, animlib
 
-        if not names:
-            col = layout.column(align=True)
-            col.label(text="动作库还没扫描（第一次约 20 秒）", icon="INFO")
-            col.operator("hs2.scan_clips", text="开始扫描", icon="FILE_REFRESH")
-        else:
-            row = layout.row(align=True)
-            row.label(text="%d 个可用动作" % len(names), icon="ACTION")
-            row.operator("hs2.scan_clips", text="", icon="FILE_REFRESH")
-            layout.prop(scn, "hs2_clip_filter", text="", icon="VIEWZOOM")
-
-        # 下拉框：点开可以直接打字搜索，比「输入框实时过滤」舒服
-        layout.prop(scn, "hs2_clip_enum", text="")
-
-        if names:
-            idx, names2 = ops.clip_index(context)
-            box = layout.box()
-            row = box.row(align=True)
-            row.operator("hs2.clip_step", text="", icon="TRIA_LEFT").delta = -1
-            sub = row.row(align=True)
-            sub.alignment = "CENTER"
-            sub.label(text=scn.hs2_clip_name or names2[idx])
-            row.operator("hs2.clip_step", text="", icon="TRIA_RIGHT").delta = 1
-
-            box.prop(scn, "hs2_clip_pos", text="%d / %d" % (idx + 1, len(names2)),
-                     slider=True)
-
-            # 选完就自动装，不用再点「导入」
-            box.prop(scn, "hs2_clip_auto", text="切换后自动加载")
-            row = box.row(align=True)
-            op = row.operator("hs2.import_clip", text="重新导入",
-                              icon="FILE_REFRESH")
-            op.clip_name = scn.hs2_clip_name or names2[idx]
-            op.follow = True
-
-        # ---- 外部动作 ----
-        box = layout.box()
-        box.label(text="外部动作", icon="IMPORT")
-        col = box.column(align=True)
-        col.operator("hs2.import_vmd", text="导入 VMD（MMD 舞蹈）", icon="FILE_MOVIE")
-        col.operator("hs2.import_mixamo", text="导入 Mixamo FBX", icon="FILE_3D")
-        box.prop(scn, "hs2_arm_tilt", text="手臂轴倾校准")
-
-        clip = ops.STATE.get("clip")
-        if clip is not None:
-            box = layout.box()
-            box.label(text="当前：%s" % clip.name, icon="ACTION")
-            box.label(text="%d 帧 · %.2f 秒 · %d 根骨"
-                      % (clip.frame_count, clip.duration, len(clip.tracks)))
-
-
-class HS2_PT_rig(bpy.types.Panel):
-    bl_label = "控制器"
-    bl_idname = "HS2_PT_rig"
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "HS2"
-    bl_parent_id = "HS2_PT_main"
-
-    @_safe
-    def draw(self, context):
-        layout = self.layout
         arm = _arm(context)
         if arm is None:
-            layout.label(text="请先加载角色")
+            draw_actor_selector(layout, context)
+            layout.label(text="先在「动作」里点一条动作（没有演员会自动上场）",
+                         icon="INFO")
             return
 
-        if not rig.has_rig(arm):
+        # 多人场景：先确认正在编辑谁（下面所有工具都只针对这个演员）
+        draw_actor_selector(layout, context)
+
+        act = api.current_action()
+        has_action = act is not None
+        if has_action:
+            lo, hi = 1, 1
+            try:
+                lo, hi = animlib.action_range(act)
+            except Exception:
+                pass
+            box = layout.box()
+            row = box.row(align=True)
+            row.label(text=arm.name, icon="ARMATURE_DATA")
+            _right(row).label(text="%d 帧" % (hi - lo + 1))
+            box.label(text="当前动作：%s" % act.name, icon="ACTION")
+
+        # ---- 控制器（只有装了动作、或者场景里有演员才需要）----
+        if rig.has_rig(arm):
+            box = layout.box()
+            on = rig.ik_state(arm)
+            row = box.row(align=True)
+            row.label(text="IK %s" % ("开" if on else "关"), icon="CONSTRAINT")
+            row.operator("hs2.toggle_ik", text="开",
+                         icon="CHECKBOX_HLT").enable = True
+            row.operator("hs2.toggle_ik", text="关",
+                         icon="CHECKBOX_DEHLT").enable = False
+            grid = box.grid_flow(row_major=True, columns=2, align=True)
+            for side in ("L", "R"):
+                for is_leg in (True, False):
+                    nm = rig.foot_ctrl(side) if is_leg else rig.hand_ctrl(side)
+                    pb = arm.pose.bones.get(nm)
+                    if pb is None:
+                        continue
+                    grid.prop(pb, '["ik"]',
+                              text=("脚 " if is_leg else "手 ") + side,
+                              slider=True)
+            row = box.row(align=True)
+            row.prop(arm, "hs2_jointfix", text="关节校正", toggle=True)
+            row.operator("hs2.key_targets", text="重打控制器帧",
+                         icon="KEYFRAME")
+            row = box.row(align=True)
+            row.operator("hs2.snap_ik", text="控制器吸附姿势", icon="SNAP_ON")
+            row.operator("hs2.snap_fk", text="IK 写回 FK", icon="SNAP_OFF")
+            row = box.row(align=True)
+            op = row.operator("hs2.add_rig_all", text="重建所有演员的控制器",
+                              icon="FILE_REFRESH")
+            op.fingers = scn.hs2_fingers
+            row.operator("hs2.clear_rig", text="清除", icon="CANCEL")
+        else:
             col = layout.column(align=True)
-            col.scale_y = 1.25
-            op = col.operator("hs2.add_rig", text="生成控制器", icon="CONSTRAINT")
-            op.fingers = False
-            op.follow = True
-            layout.label(text="全身 FK + 手脚 IK + 可选手指控制器", icon="INFO")
-            return
+            col.scale_y = 1.3
+            op = col.operator("hs2.add_rig_all",
+                              text="给所有演员加控制器（FK + 手脚 IK）",
+                              icon="CONSTRAINT")
+            op.fingers = scn.hs2_fingers
+            col.prop(scn, "hs2_fingers", text="连手指一起做")
 
-        col = layout.column(align=True)
-        op = col.operator("hs2.add_rig", text="重建控制器", icon="FILE_REFRESH")
-        op.fingers = bool(arm.get("hs2_fingers"))
-        op.follow = True
+        # ---- 动作后处理（只在有动作时可做，生成新动作、原动作保留）----
+        if has_action:
+            box = layout.box()
+            box.label(text="动作后处理（生成新动作，原动作不丢）",
+                      icon="TOOL_SETTINGS")
+            grid = box.grid_flow(row_major=True, columns=2, align=True)
+            grid.operator("hs2.edit_action", text="左右镜像",
+                          icon="MOD_MIRROR").mode = "MIRROR"
+            grid.operator("hs2.edit_action", text="放回地面",
+                          icon="SNAP_ON").mode = "GROUND"
+            op = grid.operator("hs2.edit_action", text="慢放一倍",
+                               icon="TIME")
+            op.mode = "SPEED"
+            op.value = 2.0
 
-        # ---- IK ----
-        box = layout.box()
-        on = rig.ik_state(arm)
-        row = box.row(align=True)
-        row.label(text="IK 总开关：%s" % ("开" if on else "关"), icon="CONSTRAINT")
-        row.operator("hs2.toggle_ik", text="开", icon="CHECKBOX_HLT").enable = True
-        row.operator("hs2.toggle_ik", text="关", icon="CHECKBOX_DEHLT").enable = False
+            box = layout.box()
+            box.label(text="根动画（把 Hips 运动抽到 p_cf_anim）",
+                      icon="ARMATURE_DATA")
+            row = box.row(align=True)
+            row.prop(scn, "hs2_rm_move", toggle=True)
+            row.prop(scn, "hs2_rm_turn", toggle=True)
+            row.prop(scn, "hs2_rm_jump", toggle=True)
+            row = box.row(align=True)
+            row.scale_y = 1.2
+            row.operator("hs2.root_motion", text="生成根动画动作",
+                         icon="FORWARD")
 
-        grid = box.grid_flow(row_major=True, columns=2, align=True)
-        for side in ("L", "R"):
-            for is_leg in (True, False):
-                nm = rig.foot_ctrl(side) if is_leg else rig.hand_ctrl(side)
-                pb = arm.pose.bones.get(nm)
-                if pb is None:
-                    continue
-                grid.prop(pb, '["ik"]', text=("脚 " if is_leg else "手 ") + side,
-                          slider=True)
+        # ---- 手势 ----
+        row = layout.row(align=True)
+        row.prop(scn, "hs2_show_hand", text="手势", toggle=True, icon="HAND")
+        if scn.hs2_show_hand:
+            box = layout.box()
+            box.label(text="选好左右手手势，再写入关键帧", icon="HAND")
+            row = box.row(align=True)
+            row.prop(scn, "hs2_hand_L", text="左手")
+            row.prop(scn, "hs2_hand_R", text="右手")
+            box.prop(scn, "hs2_hand_key", text="在当前帧写关键帧")
+            row = box.row(align=True)
+            op = row.operator("hs2.apply_hand_pose", text="写入关键帧",
+                              icon="KEYINGSET")
+            op.mode = "BOTH"
+            op.keyframe = scn.hs2_hand_key
+            row.operator("hs2.apply_hand_pose", text="还原",
+                         icon="LOOP_BACK").mode = "RESET"
 
-        # ---- Studio 分组（对应工作室的 ActiveIK 5 组）----
-        box = layout.box()
-        box.label(text="Studio 分组（ActiveIK）", icon="GROUP")
-        row = box.row(align=True)
-        for prop, label in (("hs2_studio_body", "Body"),
-                            ("hs2_studio_arm_L", "臂 L"),
-                            ("hs2_studio_arm_R", "臂 R"),
-                            ("hs2_studio_leg_L", "腿 L"),
-                            ("hs2_studio_leg_R", "腿 R")):
-            if hasattr(arm, prop):
-                row.prop(arm, prop, text=label, toggle=True)
-
-        # ---- 关节补偿 ----
-        box = layout.box()
-        box.prop(arm, "hs2_jointfix", text="关节校正（dam 骨随膝/肘/臀转）",
-                 toggle=True)
-        box.label(text="VMD 导入默认开；游戏动作默认关（原动作自带 dam 曲线）",
-                  icon="INFO")
-
-        # ---- 吸附 / 打帧 ----
-        col = layout.column(align=True)
-        col.operator("hs2.snap_ik", text="控制器吸附当前姿势", icon="SNAP_ON")
-        col.operator("hs2.snap_fk", text="IK 结果写回 FK", icon="SNAP_OFF")
-        col.operator("hs2.key_targets", text="控制器重新跟随整段动作", icon="KEYFRAME")
-
-        # ---- 显示 ----
-        box = layout.box()
-        box.label(text="显示", icon="HIDE_OFF")
-        row = box.row(align=True)
-        for name, label in ((rig.COLL_CTRL, "控制"), (rig.COLL_IK, "IK"),
-                            (rig.COLL_DEF, "变形"), (rig.COLL_FACE, "面部"),
-                            (rig.COLL_MISC, "其它"), (rig.COLL_FINGER, "手指")):
-            coll = arm.data.collections_all.get(name)
-            if coll is None:
-                continue
-            sub = row.row(align=True)
-            sub.prop(coll, "is_visible", text=label, toggle=True, emboss=False)
-        if not arm.show_in_front:
-            box.operator("hs2.show_in_front", icon="RESTRICT_VIEW_OFF")
+        # ---- 导出提示（就一句话，不放按钮）----
+        layout.label(text="导出：选中骨架 → 文件 → 导出 → FBX（勾「仅变形骨」）",
+                     icon="INFO")
 
 
-class HS2_PT_out(bpy.types.Panel):
-    bl_label = "输出"
-    bl_idname = "HS2_PT_out"
+# --------------------------------------------------------------------------
+# 外部动作（另一种用法：自己带动作进来）
+# --------------------------------------------------------------------------
+
+class HS2_PT_ext(bpy.types.Panel):
+    bl_label = "外部动作"
+    bl_idname = "HS2_PT_ext"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "HS2"
     bl_parent_id = "HS2_PT_main"
+    bl_options = {"DEFAULT_CLOSED"}
 
     @_safe
     def draw(self, context):
         layout = self.layout
-        arm = _arm(context)
+        from . import api
+
+        layout.label(text="手上有 VMD / Mixamo 动作时走这里", icon="NONE")
         col = layout.column(align=True)
-        col.operator("hs2.bake_fk", text="烘焙为纯 FK", icon="ACTION")
-        op = col.operator("hs2.export_fbx", text="导出 FBX", icon="EXPORT")
-        op.include_mesh = False
-        op.deform_only = True
-        col.operator("hs2.batch_export", icon="PACKAGE")
-        if arm is not None and arm.get("hs2_baked"):
-            layout.label(text="已烘焙为纯 FK（控制器不再影响姿势）", icon="CHECKMARK")
+        col.scale_y = 1.3
+        col.operator("hs2.import_vmd", text="导入 VMD（MMD 舞蹈）",
+                     icon="FILE_MOVIE")
+        col.operator("hs2.import_mixamo", text="导入 Mixamo FBX",
+                     icon="FILE_3D")
+        layout.label(text="没演员会自动放一个，装完到「调整」里改", icon="NONE")
+
+        box = layout.box()
+        box.label(text="手动放人（自制动作用）", icon="ARMATURE_DATA")
+        row = box.row(align=True)
+        row.operator("hs2.load_default", text="+ 女角",
+                     icon="ARMATURE_DATA").male = False
+        row.operator("hs2.load_default", text="+ 男角",
+                     icon="ARMATURE_DATA").male = True
+        chars = api.characters()
+        if chars:
+            row = box.row(align=True)
+            for slot in sorted(chars, key=lambda x: (x[0] != "f", x)):
+                ch = chars[slot]
+                op = row.operator("hs2.select_char", text=ch.name,
+                                  emboss=True,
+                                  depress=(ch is api.active_character()))
+                op.name = ch.name
+                op = row.operator("hs2.delete_char", text="", icon="X")
+                op.name = ch.name
 
 
-CLASSES = (HS2_PT_main, HS2_PT_anim, HS2_PT_rig, HS2_PT_out)
+CLASSES = (HS2_PT_main, HS2_PT_edit, HS2_PT_ext,
+           HS2_UL_studio, HS2_UL_h, HS2_UL_stage)
 
 
 def register():

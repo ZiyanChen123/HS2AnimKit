@@ -1,15 +1,19 @@
 """Blender 操作符。"""
 
+import contextlib
 import os
 import time
 
 import bpy
 from bpy.props import (BoolProperty, EnumProperty, FloatProperty, IntProperty,
                        StringProperty)
+from mathutils import Matrix
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 
-from . import anim, bdata, handpose, mmdrig, retarget, rig, vmd as vmdlib
+from . import anim, bdata, compat, handpose, mmdrig, retarget, rig
+from . import vmd as vmdlib
 from .ripper import GameAssets
+from .ripper import hdb as _hdb
 from .ripper import mesh as _mesh
 
 _ASSETS = {}
@@ -70,14 +74,40 @@ def game_dir_of(context):
     return auto or d
 
 
+def _is_arm(ob):
+    try:
+        return (ob is not None
+                and ob.name in bpy.data.objects
+                and ob.type == "ARMATURE"
+                and ob.data.bones.get("cf_J_Root") is not None)
+    except Exception:
+        return False
+
+
 def current_arm():
+    """当前操作的骨架：**选中的**优先，其次默认那个，最后随便一个。"""
+    ob = bpy.context.view_layer.objects.active
+    if _is_arm(ob):
+        return ob
+    for sel in bpy.context.selected_objects:
+        if _is_arm(sel):
+            return sel
     arm = bpy.data.objects.get(ARM_NAME)
     if arm is not None and arm.type == "ARMATURE":
         return arm
-    ob = bpy.context.view_layer.objects.active
-    if ob is not None and ob.type == "ARMATURE" and ob.data.bones.get("cf_J_Root"):
-        return ob
+    for ob in bpy.data.objects:
+        if ob.type == "ARMATURE" and ob.data.bones.get("cf_J_Root"):
+            return ob
     return None
+
+
+def game_dir_from_arm(arm):
+    """骨架身上记着它来自哪个游戏目录，重开 .blend 也不会丢。"""
+    d = (arm.get("hs2_game_dir") if arm is not None else "") or ""
+    if d and os.path.isfile(os.path.join(d, "abdata", "chara",
+                                         "oo_base.unity3d")):
+        return d
+    return detect_game_dir() or game_dir_of(bpy.context)
 
 
 def _tag_redraw(context):
@@ -86,6 +116,39 @@ def _tag_redraw(context):
             area.tag_redraw()
     except Exception:
         pass
+
+
+def remove_character(arm):
+    """删角色：骨架 + 它自己的身体/头部网格（不动别的角色）。"""
+    if arm is None:
+        return False
+    for key in ("hs2_body", "hs2_head"):
+        nm = arm.get(key)
+        if nm:
+            _remove_object(nm)
+    _remove_object(arm.name)
+    return True
+
+
+def rename_character(arm, name):
+    """给角色改个名（列表里显示用），连带网格一起改。"""
+    old = arm.name
+    if not name or name == old:
+        return False
+    body = arm.get("hs2_body") or ""
+    head = arm.get("hs2_head") or ""
+    arm.name = name
+    if body:
+        ob = bpy.data.objects.get(body)
+        if ob is not None:
+            ob.name = body.replace(old, name, 1) if old in body else body
+            arm["hs2_body"] = ob.name
+    if head:
+        ob = bpy.data.objects.get(head)
+        if ob is not None:
+            ob.name = head.replace(old, name, 1) if old in head else head
+            arm["hs2_head"] = ob.name
+    return True
 
 
 def _remove_object(name):
@@ -122,6 +185,93 @@ class HS2_OT_detect_dir(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def taken_slots():
+    """场景里已经占用的角色槽（女1/女2/男1/男2）。"""
+    out = set()
+    for ob in bpy.data.objects:
+        if ob.type == "ARMATURE" and ob.get("hs2_slot"):
+            out.add(ob.get("hs2_slot"))
+    return out
+
+
+def free_slot(gender):
+    """给这个性别找个空槽；两个都占了就 None。"""
+    order = ("f1", "f2") if gender == "female" else ("m1", "m2")
+    taken = taken_slots()
+    for sl in order:
+        if sl not in taken:
+            return sl
+    return None
+
+
+def build_default(g, include_head=True, scale=0.1, cleanup=True,
+                  body_mesh_name=None, name=None, gender="female", slot=None):
+    """加载默认角色（骨架 + 身体 + 头）。
+
+    返回 (arm, names, body, head)；操作符和 :mod:`api` 都走这一个入口。
+    ``body_mesh_name`` 可以换成 ``o_body_cm``（男角素体）。
+    加载完会在骨架上记下 **槽位和性别** —— H 动作的阵容判断全靠它。
+    """
+    skel = g.skeleton()
+    if body_mesh_name is None and gender == "male":
+        body_mesh_name = _mesh.BODY_MALE_MESH
+    data = g.body_mesh(body_mesh_name)
+
+    head = None
+    if include_head:
+        try:
+            if gender == "male":
+                head = g.head(bundle_name="mo_head_00", prefab="p_cm_head_00")
+            else:
+                head = g.head()
+        except Exception as e:
+            print("[HS2] 头部没读到：%s" % e)
+
+    arm_name = name or ARM_NAME
+    if arm_name == ARM_NAME:
+        body_name, head_name = BODY_NAME, HEAD_NAME
+    else:
+        tail = arm_name.replace("HS2_Default", "").strip("_") or "x"
+        body_name = "%s_%s" % (BODY_NAME, tail)
+        head_name = "%s_%s" % (HEAD_NAME, tail)
+    if cleanup:
+        for nm in (arm_name, body_name, head_name):
+            _remove_object(nm)
+
+    extra = None
+    if head:
+        extra = [{"name": b["name"], "parent": b["parent"],
+                  "world": b["world"], "deform": b["deform"]}
+                 for b in head["bones"]]
+
+    arm, names = bdata.build_armature(skel, name=arm_name,
+                                      scale=scale, extra=extra)
+    arm["hs2_game_dir"] = g.game_dir
+    arm["hs2_gender"] = gender
+    arm["hs2_slot"] = slot or free_slot(gender) or (
+        "f1" if gender == "female" else "m1")
+    arm["hs2_body"] = body_name
+    arm["hs2_head"] = head_name
+    body = bdata.build_mesh(data, skel, names, arm, name=body_name,
+                            scale=scale)
+
+    head_obj = None
+    if head:
+        hd = dict(head["mesh"])
+        hd["group_names"] = hd.get("bone_names") or []
+        head_obj = bdata.build_mesh(hd, skel, names, arm, name=head_name,
+                                    scale=scale, xform=head["attach"])
+
+    STATE.update(names=names, skel=skel, arm=arm, mesh=body, head=head_obj,
+                 game=g, scale=scale)
+
+    for ob in list(bpy.context.selected_objects):
+        ob.select_set(False)
+    arm.select_set(True)
+    bpy.context.view_layer.objects.active = arm
+    return arm, names, body, head_obj
+
+
 class HS2_OT_load_default(bpy.types.Operator):
     """加载 HS2 默认角色：默认骨架 + 素模（身体 + 头），完全没捏过的状态"""
     bl_idname = "hs2.load_default"
@@ -132,61 +282,37 @@ class HS2_OT_load_default(bpy.types.Operator):
     include_head: BoolProperty(name="带头部", default=True,
                                description="从 fo_head_00 取头骨与头部网格")
     scale: FloatProperty(name="单位缩放", default=0.1, min=0.001, max=10.0)
+    male: BoolProperty(name="男角素体", default=False,
+                       description="用 o_body_cm（男角身体），骨架是同一副")
 
     def execute(self, context):
         t0 = time.time()
         g = get_assets(game_dir_of(context))
+        gender = "male" if self.male else "female"
+        slot = free_slot(gender)
+        if slot is None:
+            self.report({"ERROR"}, "已经是两个%s角色了" % (
+                "男" if self.male else "女",))
+            return {"CANCELLED"}
+        name = {"f1": ARM_NAME, "m1": "HS2_Default_Male",
+                "f2": "HS2_Default_f2", "m2": "HS2_Default_m2"}.get(
+                    slot, "HS2_Default_" + slot)
         try:
-            skel = g.skeleton()
-            data = g.body_mesh()
+            arm, names, body, head_obj = build_default(
+                g, include_head=self.include_head, scale=self.scale,
+                cleanup=self.cleanup, name=name, gender=gender, slot=slot,
+                body_mesh_name=_mesh.BODY_MALE_MESH if self.male else None)
         except Exception as e:
             self.report({"ERROR"}, "读取失败：%s" % e)
             return {"CANCELLED"}
 
-        head = None
-        if self.include_head:
-            try:
-                head = g.head()
-            except Exception as e:
-                self.report({"WARNING"}, "头部没读到：%s" % e)
-
-        if self.cleanup:
-            for name in (ARM_NAME, BODY_NAME, HEAD_NAME):
-                _remove_object(name)
-
-        extra = None
-        if head:
-            extra = [{"name": b["name"], "parent": b["parent"],
-                      "world": b["world"], "deform": b["deform"]}
-                     for b in head["bones"]]
-
-        arm, names = bdata.build_armature(skel, name=ARM_NAME,
-                                          scale=self.scale, extra=extra)
-        body = bdata.build_mesh(data, skel, names, arm, name=BODY_NAME,
-                                scale=self.scale)
-
-        head_obj = None
-        if head:
-            hd = dict(head["mesh"])
-            hd["group_names"] = hd.get("bone_names") or []
-            head_obj = bdata.build_mesh(hd, skel, names, arm, name=HEAD_NAME,
-                                        scale=self.scale,
-                                        xform=head["attach"])
-
-        STATE.update(names=names, skel=skel, arm=arm, mesh=body, head=head_obj,
-                     game=g, scale=self.scale)
-
-        for ob in list(bpy.context.selected_objects):
-            ob.select_set(False)
-        arm.select_set(True)
-        bpy.context.view_layer.objects.active = arm
-
         total = len(arm.data.bones)
-        self.report({"INFO"}, "骨架 %d 骨（含面部 %d），身体 %d 顶点，头 %s，用时 %.1fs"
-                    % (total, total - len(names),
-                       len(data["vertices"]),
-                       ("%d 顶点" % len(head["mesh"]["vertices"])) if head else "无",
-                       time.time() - t0))
+        self.report({"INFO"},
+                    "已放 %s：骨架 %d 骨（含面部 %d），身体 %d 顶点，头 %s，用时 %.1fs"
+                    % (slot, total, total - len(names),
+                       len(body.data.vertices),
+                       ("%d 顶点" % len(head_obj.data.vertices)) if head_obj
+                       else "无", time.time() - t0))
         return {"FINISHED"}
 
 
@@ -241,7 +367,10 @@ class HS2_OT_add_head(bpy.types.Operator):
 class HS2_OT_scan_clips(bpy.types.Operator):
     """扫描游戏里的全部动作（第一次会慢些，之后有缓存）"""
     bl_idname = "hs2.scan_clips"
-    bl_label = "扫描动作库"
+    bl_label = "重建动作库索引"
+
+    rebuild: BoolProperty(name="重建", default=True,
+                          description="丢掉旧缓存重新扫一遍")
 
     def execute(self, context):
         g = get_assets(game_dir_of(context))
@@ -253,7 +382,7 @@ class HS2_OT_scan_clips(bpy.types.Operator):
         wm.progress_begin(0, 100)
         t0 = time.time()
         try:
-            idx = g.clip_index(rebuild=True, progress=progress)
+            idx = g.clip_index(rebuild=self.rebuild, progress=progress)
         except Exception as e:
             wm.progress_end()
             self.report({"ERROR"}, "扫描失败：%s" % e)
@@ -261,6 +390,11 @@ class HS2_OT_scan_clips(bpy.types.Operator):
         wm.progress_end()
         STATE["index"] = idx
         clear_enum_cache()
+        try:
+            from . import ops2
+            ops2.invalidate_lists()
+        except Exception:
+            pass
         good = sum(1 for v in idx.values() if _fit_of(v) >= MIN_FIT)
         self.report({"INFO"}, "共 %d 个动作，其中 %d 个适配这副骨架，用时 %.0fs"
                     % (len(idx), good, time.time() - t0))
@@ -284,46 +418,236 @@ def _files_of(entry):
     return entry or []
 
 
-def clip_list(context):
-    """当前过滤条件下的动作名列表（排序）。"""
+def clip_table(context, fit=True):
+    """统一来源：fit 过滤后的 {动作名: index条目}。
+
+    「面板分类下拉」和「动作过滤」都用这一份数据，保证两边对分类/数量的
+    理解一致 —— 之前分类下拉读 catalog()、过滤读 clip_index()，两边对
+    group 的判断不同，导致选 sao 这类组时列表直接清空。
+    """
     try:
         g = STATE.get("game") or get_assets(game_dir_of(context))
         idx = g.clip_index()
     except Exception:
-        return []
+        return {}
+    if not idx:
+        return {}
+    if not fit:
+        return idx
+    return {n: idx[n] for n in idx if _fit_of(idx.get(n)) >= MIN_FIT}
+
+
+# 工作室动作的身高变体：{基础名: {身高字母: 具体动作名}}
+_STUDIO_VAR_CACHE = {"key": None, "map": None}
+
+
+def _studio_variant_map(context):
+    """把带 S/M/L 后缀的同一工作室动作并成一条（cook_01_S/M/L → cook_01）。
+
+    这是 HS2 的「同一动作给三个身高」，列表里不该把三条全堆出来 ——
+    用户看到一条 cook_01，用身高档位去切。返回：
+        {基础名: (首选身高字母, {字母: 具体动作名})}
+    也顺带记下首选的默认档（优先 M，其次 L，再 S）。
+
+    一个基础名可能同时有干净版（chair_17_M）、loop 版（chair_17_M_loop）、
+    甚至 dirty 版：为每个身高字母挑「最干净」的具体名（非 loop、非 dirty 优先）。
+    """
+    idx = clip_table(context)
+    # 缓存：键用 (动作集指纹, 分类, 过滤) —— 分类/过滤变化时重建
+    scn = getattr(context, "scene", None) if hasattr(context, "scene") else None
+    cat = (getattr(scn, "hs2_clip_cat", "") or "") if scn else ""
+    filt = (getattr(scn, "hs2_clip_filter", "") or "") if scn else ""
+    sig = (tuple(sorted(idx)), cat, filt)
+    if _STUDIO_VAR_CACHE["key"] == sig:
+        return _STUDIO_VAR_CACHE["map"] or {}
+    _BASE = _hdb.split_variants
+
+    def _clean(v):
+        """干净分：非 dirty 记 0，非 loop 记 0；两种情况各 +1。"""
+        return (0 if not v["dirty"] else 1, 0 if not v["loop"] else 1)
+
+    cands = {}   # base -> {letter: [(cleanliness, name), ...]}
+    for name in idx:
+        v = _BASE(name)
+        if not v["height"]:
+            continue
+        base_map = cands.setdefault(v["base"], {})
+        per_letter = base_map.setdefault(v["height"], [])
+        per_letter.append((_clean(v), name))
+    out = {}
+    for b, per_letter in cands.items():
+        hv = {}
+        for letter, items in per_letter.items():
+            if not items:
+                continue
+            items.sort(key=lambda x: x[0])          # 最干净在前
+            hv[letter] = items[0][1]
+        if not hv:
+            continue
+        default = ("M" if "M" in hv else
+                   ("L" if "L" in hv else "S"))
+        out[b] = (default, hv)
+    _STUDIO_VAR_CACHE["key"] = sig
+    _STUDIO_VAR_CACHE["map"] = out
+    return out
+
+
+def resolve_studio_clip(base_or_name, height=None):
+    """把列表里显示的基础名还原成具体的动作名。
+
+    ``cook_01`` + 身高 ``L`` → ``cook_01_L``（存在才返回，否则回退基础名）。
+    传进来本来就是个具体动作名就原样返回。
+
+    关键：动作**没有** S/M/L 变体时（比如 walk_Idle_00），必须原样返回基础名，
+    绝不能拼成 ``xxx_M`` —— 否则会报「游戏里没有叫 xxx_M 的动作」。
+
+    唯一键可能带控制器后缀（``attack_00 @ f_03_Sword``）—— 那时变体表里
+    找不到（变体名不带后缀），直接原样返回就行：官方条目已经带着精确的
+    path_id，本来就不需要再挑变体。
+    """
+    base = base_or_name
+    if " @ " in base:
+        return base
+    # 保证变体表已建好（draw 时可能还没轮到本动作）
+    if not _STUDIO_VAR_CACHE["map"]:
+        try:
+            _studio_variant_map(bpy.context)
+        except Exception:
+            pass
+    idx = _STUDIO_VAR_CACHE["map"] or {}
+    hv = idx.get(base)
+    if hv:
+        h = height or hv[0]          # 没指定就用该动作默认档
+        if h in hv[1]:
+            return hv[1][h]
+        return hv[1][hv[0]]          # 档不存在就回退默认档
+    return base
+
+
+def clip_list(context, collapse=True):
+    """当前过滤条件下的动作名列表（排序）。
+
+    分类是**两级**的（跟游戏一致）：
+      * ``hs2_clip_cat``  = 大分類（大きい項目）—— 角色 / バトル / キャラ2 …
+      * ``hs2_clip_sub``  = 小分類（中間項目）—— 椅子 / 女 片手剣 / グラビア …
+
+    分类过滤只看**分组键**，避免 category 子串误匹配导致数量爆炸/列表为空。
+    ``collapse=True`` 时把同一动作的 S/M/L 三条并成一条（列表只显示基础名）。
+
+    默认把 studio 包内嵌的 H 动作（S_Idle / M_Idle / L_MLoop 这类 H 阶段片段，
+    group=="H"）滤掉 —— 它们是 H 动画的阶段切块，当不成独立动作演；只
+    在分类明确选「H」时才放进来。
+    """
+    idx = clip_table(context)
     if not idx:
         return []
     names = sorted(idx.keys())
 
-    # 恒定滤掉「不是给这个骨架的」：男角 / 道具 / 椅子 / 双人动作
-    names = [n for n in names if _fit_of(idx.get(n)) >= MIN_FIT]
-
     scn = getattr(context, "scene", None)
+    cat = (getattr(scn, "hs2_clip_cat", "") or "").strip() if scn else ""
+    sub = (getattr(scn, "hs2_clip_sub", "") or "").strip() if scn else ""
+    if cat in ("", "ALL", "～", "所有"):
+        cat = ""
+    if sub in ("", "ALL", "～", "所有"):
+        sub = ""
+    only_h = (cat == "H")
+    if cat or sub:
+        kept = []
+        for n in names:
+            e = idx.get(n) or {}
+            if e.get("group") == "H" and not only_h:
+                continue              # H 阶段片段，默认不混进 Studio 列表
+            if cat and not _in_top(e, cat):
+                continue
+            if sub and not _in_sub(e, sub):
+                continue
+            kept.append(n)
+        names = kept
+    else:
+        # 没选分类时也要滤掉 H 阶段片段（否则折叠后只剩 MLoop/Idle 这类无意义的基底）
+        names = [n for n in names
+                 if only_h or (idx.get(n) or {}).get("group") != "H"]
     filt = (getattr(scn, "hs2_clip_filter", "") or "").strip().lower() if scn else ""
     if filt:
         names = [n for n in names if filt in n.lower()]
+    if collapse:
+        vmap = clip_variant_base(names, idx)
+        return vmap
     return names
 
 
+def _in_top(e, cat):
+    """这条动作属于这个大分類吗？"""
+    if cat == "H":
+        return (e or {}).get("group") == "H"
+    top = (e or {}).get("top_cn") or ""
+    if top == cat:
+        return True
+    # 老条目（不在官方表里）没有 top_cn，退回按 category / group 判断
+    return ((e or {}).get("top") == cat
+            or (e or {}).get("category", "").split("/")[0] == cat)
+
+
+def _in_sub(e, sub):
+    """这条动作属于这个小分類吗？"""
+    cat = (e or {}).get("category") or ""
+    if "/" in cat and cat.split("/", 1)[1] == sub:
+        return True
+    return ((e or {}).get("group_cn") == sub
+            or (e or {}).get("group") == sub)
+
+
+def clip_variant_base(names, idx):
+    """把一批具体动作名里带 S/M/L 身高变体的几条折叠成基础名。
+
+    规则：只要 ``split_variants`` 认定这条带身高后缀（不管是 ``_loop`` 还是
+    D_ 变体、还是普通后缀），就并成基础名。比如 chair_17_L / chair_17_M /
+    chair_17_L_loop / chair_17_S_dirty... 全部 → ``chair_17``。
+
+    顺序尽量稳定：同一基础名只出现一次。
+    """
+    _BASE = _hdb.split_variants
+    seen = set()
+    out = []
+    for n in names:
+        b = _BASE(n)
+        if b["height"]:
+            key = b["base"]               # 一切带身高后缀的都折叠到基础名
+        else:
+            key = n
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
 def clip_index(context):
-    """当前滑条位置对应的下标。"""
+    """当前选中的动作在过滤结果里的下标。"""
     names = clip_list(context)
     if not names:
         return 0, []
-    if len(names) == 1:
-        return 0, names
-    scn = context.scene
-    i = int(round(float(getattr(scn, "hs2_clip_pos", 0.0)) * (len(names) - 1)))
-    return max(0, min(i, len(names) - 1)), names
+    scn = getattr(context, "scene", None)
+    name = ""
+    if scn is not None and hasattr(scn, "hs2_studio_items"):
+        i = getattr(scn, "hs2_studio_index", -1)
+        items = scn.hs2_studio_items
+        if 0 <= i < len(items):
+            name = items[i].value
+    if name in names:
+        return names.index(name), names
+    return 0, names
 
 
 def current_clip_name(context):
-    """当前选中的动作名（滑条没动过时也能拿到，不会返回空串）。"""
+    """当前列表里选中的动作名（没有就返回第一个）。"""
     scn = getattr(context, "scene", None)
-    name = (getattr(scn, "hs2_clip_name", "") or "").strip() if scn else ""
-    if name:
-        return name
-    _i, names = clip_index(context)
+    if scn is not None and hasattr(scn, "hs2_studio_items"):
+        i = getattr(scn, "hs2_studio_index", -1)
+        items = scn.hs2_studio_items
+        if 0 <= i < len(items):
+            return items[i].value
+    names = clip_list(context)
     return names[0] if names else ""
 
 
@@ -403,62 +727,13 @@ class HS2_OT_show_in_front(bpy.types.Operator):
         return {"FINISHED"}
 
 
-def clip_items(self, context):
-    try:
-        g = STATE.get("game") or get_assets(game_dir_of(context))
-        idx = g.clip_index()
-    except Exception:
-        return [("", "请先扫描动作库", "")]
-    if not idx:
-        return [("", "没有扫描到动作", "")]
-
-    filt = ""
-    scn = getattr(context, "scene", None)
-    if scn is not None:
-        filt = (getattr(scn, "hs2_clip_filter", "") or "").strip().lower()
-    names = sorted(idx.keys())
-    if filt:
-        names = [n for n in names if filt in n.lower()]
-    if not names:
-        return [("", "没有匹配的动作", "")]
-    return [(n, n, ",".join(_files_of(idx[n]))) for n in names[:400]]
-
-
-# --------------------------------------------------------------------------
-# 下拉框用的枚举（带缓存：1261 个动作每次都重建会很卡）
-# --------------------------------------------------------------------------
-
-_ENUM = {"key": None, "items": []}
-
-
-def clip_enum_items(self, context):
-    """动作下拉框的候选项。
-
-    EnumProperty 在每次绘制 UI 时都会回调这里，所以必须缓存 ——
-    不然 1261 个字符串每帧重排，面板会明显发卡。
-    """
-    names = clip_list(context)
-    scn = getattr(context, "scene", None)
-    cur = (getattr(scn, "hs2_clip_name", "") or "") if scn else ""
-    key = (len(names), names[0] if names else "", names[-1] if names else "", cur)
-    if _ENUM["key"] == key:
-        return _ENUM["items"]
-
-    items = []
-    if cur and cur not in names:
-        # 当前选的名字被过滤掉了，也要能显示出来
-        items.append((cur, cur, ""))
-    items.extend([(n, n, "") for n in names])
-    if not items:
-        items = [("", "（先扫描动作库）", "")]
-    _ENUM["key"] = key
-    _ENUM["items"] = items
-    return items
-
-
 def clear_enum_cache():
-    _ENUM["key"] = None
-    _ENUM["items"] = []
+    """（旧接口，保留兼容；列表版界面不需要枚举缓存了）"""
+    return None
+
+
+_MMDCFG_FALLBACK = [("", "（没找到 _ref/mmdd/mmdd 下的配置）", "")]
+_MMDCFG_CACHE = {"key": None, "items": _MMDCFG_FALLBACK}
 
 
 def mmdcfg_items(self, context):
@@ -466,12 +741,19 @@ def mmdcfg_items(self, context):
     from . import mmdcfg
     out = mmdcfg.list_configs()
     if not out:
-        return [("", "（没找到 _ref/mmdd/mmdd 下的配置）", "")]
+        _MMDCFG_CACHE["key"] = None
+        _MMDCFG_CACHE["items"] = _MMDCFG_FALLBACK
+        return _MMDCFG_CACHE["items"]
+    key = tuple(out)
+    if _MMDCFG_CACHE["key"] == key:
+        return _MMDCFG_CACHE["items"]
     items = [(p, n, p) for n, p in out]
     # 默认配置（MMDD TDA v2.0）排最前
-    def key(it):
+    def sort_key(it):
         return (0 if it[1] == mmdcfg.DEFAULT_INI else 1, it[1])
-    items.sort(key=key)
+    items.sort(key=sort_key)
+    _MMDCFG_CACHE["key"] = key
+    _MMDCFG_CACHE["items"] = items
     return items
 
 
@@ -493,6 +775,48 @@ def _names_for(arm, skel):
     return out
 
 
+def apply_clip_by_name(arm, name, fps=None, follow=True):
+    """按名字装 Studio 动作（给 :mod:`api` 用，不依赖 UI 上下文）。"""
+    g = get_assets(game_dir_from_arm(arm))
+    clip = g.load_clip(name, fps=fps)
+    return apply_clip_data(arm, clip, name, follow=follow)
+
+
+def apply_clip_data(arm, clip, name=None, follow=True, keyframe=True):
+    """把一份 ClipData 装到骨架上（Studio / H / 道具都走这里）。"""
+    skel = STATE.get("skel")
+    if skel is None:
+        g = get_assets(game_dir_from_arm(arm))
+        skel = g.skeleton()
+        STATE["skel"] = skel
+    names = STATE.get("names")
+    if not names:
+        names = _names_for(arm, skel)
+        STATE["names"] = names
+
+    act, info = anim.apply_clip(arm, skel, names, clip,
+                               scale=STATE.get("scale"),
+                               action_name=name or ("HS2_" + clip.name))
+    scn = bpy.context.scene
+    scn.frame_start = 0
+    scn.frame_end = max(1, info["frames"])
+    try:
+        scn.render.fps = int(round(info["fps"]))
+    except Exception:
+        pass
+    scn.frame_set(1)
+
+    keyed = 0
+    if follow and keyframe and rig.has_rig(arm):
+        keyed = rig.key_targets(arm, 1, info["frames"])
+        scn.frame_set(1)
+
+    STATE["action"] = act
+    STATE["clip"] = clip
+    STATE["action_name"] = name
+    return act, info
+
+
 def _apply_clip(context, arm, name, fps, follow=True):
     """把游戏里的动作装进当前骨架。返回 (action, info, keyed)。"""
     g = get_assets(game_dir_of(context))
@@ -505,7 +829,7 @@ def _apply_clip(context, arm, name, fps, follow=True):
     act, info = anim.apply_clip(arm, skel, names, clip, scale=STATE.get("scale"))
 
     scn = context.scene
-    scn.frame_start = 1
+    scn.frame_start = 0
     scn.frame_end = max(1, info["frames"])
     scn.render.fps = int(round(info["fps"]))
     scn.frame_set(1)
@@ -518,36 +842,6 @@ def _apply_clip(context, arm, name, fps, follow=True):
     STATE["action"] = act
     STATE["clip"] = clip
     return act, info, keyed
-
-
-class HS2_OT_clip_step(bpy.types.Operator):
-    """上一个 / 下一个动作"""
-    bl_idname = "hs2.clip_step"
-    bl_label = "切换动作"
-    bl_options = {"REGISTER"}
-
-    delta: IntProperty(default=1)
-
-    def execute(self, context):
-        names = clip_list(context)
-        if not names:
-            return {"CANCELLED"}
-        scn = context.scene
-        auto = bool(getattr(scn, "hs2_clip_auto", True))
-        if len(names) <= 1:
-            scn.hs2_clip_pos = 0.0
-            scn.hs2_clip_name = names[0]
-            if auto and current_arm() is not None:
-                schedule_clip_load(names[0], delay=0.05)
-            return {"FINISHED"}
-        i = int(round(float(scn.hs2_clip_pos) * (len(names) - 1)))
-        i = max(0, min(i + self.delta, len(names) - 1))
-        scn.hs2_clip_pos = i / float(len(names) - 1)
-        scn.hs2_clip_name = names[i]
-        # 一次点击 = 一次加载，不需要再点「导入」
-        if auto and current_arm() is not None:
-            schedule_clip_load(names[i], delay=0.05)
-        return {"FINISHED"}
 
 
 class HS2_OT_toggle_jointfix(bpy.types.Operator):
@@ -588,8 +882,8 @@ class HS2_OT_import_clip(bpy.types.Operator):
 
     def draw(self, context):
         _i, names = clip_index(context)
-        self.layout.label(text="共 %d 个动作（滑条/◀▶ 切换会自动加载）" % len(names)
-                          if names else "先扫描动作库",
+        self.layout.label(text="动作库里共 %d 个可用动作" % len(names)
+                          if names else "先到「② 动作」里扫描动作库",
                           icon="INFO")
         self.layout.prop(self, "clip_name", text="动作名")
         self.layout.prop(self, "fps")
@@ -636,9 +930,9 @@ def _after_import(context, arm, act, frames, follow):
     还原 VMD 数据，脚在哪儿就是哪儿。）
     """
     scn = context.scene
-    scn.frame_start = 1
+    scn.frame_start = 0
     scn.frame_end = max(1, frames)
-    scn.frame_set(1)
+    scn.frame_set(0)
     keyed = 0
     if follow and rig.has_rig(arm):
         keyed = rig.key_targets(arm, 1, frames)
@@ -696,8 +990,14 @@ class HS2_OT_import_vmd(bpy.types.Operator, ImportHelper):
     def execute(self, context):
         arm = current_arm()
         if arm is None:
-            self.report({"ERROR"}, "请先「加载默认角色」")
-            return {"CANCELLED"}
+            # 不用先手动放素体：没有角色就直接生成一个默认女角
+            try:
+                from . import api
+                arm = api.ensure_actor("female")
+                self.report({"INFO"}, "没有可用的角色，已自动放一个默认女角")
+            except Exception as e:
+                self.report({"ERROR"}, "生不成角色：%s" % e)
+                return {"CANCELLED"}
         handpose.release(arm)
         try:
             data = vmdlib.parse(self.filepath)
@@ -800,12 +1100,21 @@ class HS2_OT_import_mixamo(bpy.types.Operator, ImportHelper):
     with_fingers: BoolProperty(name="含手指", default=True)
     follow: BoolProperty(name="控制器跟随", default=True)
     keep_source: BoolProperty(name="保留源骨架", default=False)
+    foot_ik: BoolProperty(name="足部 IK 修正", default=True,
+                          description="用两骨 IK 把脚踝对准源动作轨迹，减少滑步")
+    joint_fix: BoolProperty(name="关节校正", default=True,
+                            description="导入后自动打开膝/肘 dam 校正")
 
     def execute(self, context):
         arm = current_arm()
         if arm is None:
-            self.report({"ERROR"}, "请先「加载默认角色」")
-            return {"CANCELLED"}
+            try:
+                from . import api
+                arm = api.ensure_actor("female")
+                self.report({"INFO"}, "没有可用的角色，已自动放一个默认女角")
+            except Exception as e:
+                self.report({"ERROR"}, "生不成角色：%s" % e)
+                return {"CANCELLED"}
         handpose.release(arm)
 
         # 清掉上一次 VMD 虚拟骨架留下的虚拟骨和 MMDD 约束，
@@ -834,10 +1143,24 @@ class HS2_OT_import_mixamo(bpy.types.Operator, ImportHelper):
 
         src_name = src.name
         t0 = time.time()
-        tracks, frames = retarget.mixamo_tracks(src, arm, f0, f1,
-                                                with_fingers=self.with_fingers)
+        tracks, frames = retarget.mixamo_tracks(
+            src, arm, f0, f1, with_fingers=self.with_fingers)
         act, n = retarget.write_curves(arm, tracks, action_name="HS2_Mixamo_" + src.name,
                                        fps=scn.render.fps, frame_count=frames)
+        if self.foot_ik:
+            retarget.foot_ik_pass(arm, src, act, 1, frames)
+        ground = retarget.ground_contact_pass(arm, act, 1, frames)
+        from . import rig as _rig
+        if self.joint_fix:
+            _rig._build_correctives(arm)
+        try:
+            arm.hs2_jointfix = bool(self.joint_fix)
+        except Exception:
+            arm["hs2_jointfix"] = 1 if self.joint_fix else 0
+        try:
+            _rig.set_joint_fix(arm, bool(self.joint_fix))
+        except Exception:
+            pass
         keyed = _after_import(context, arm, act, frames, self.follow)
 
         if not self.keep_source:
@@ -851,8 +1174,9 @@ class HS2_OT_import_mixamo(bpy.types.Operator, ImportHelper):
                 elif isinstance(data, bpy.types.Mesh) and getattr(data, "users", 0) == 0:
                     bpy.data.meshes.remove(data)
 
-        self.report({"INFO"}, "%s：%d 帧 / %d 骨，用时 %.1fs"
-                    % (src_name, frames, len(tracks), time.time() - t0))
+        fix = ("，贴地 %+.1f cm" % (ground * 100.0)) if ground else ""
+        self.report({"INFO"}, "%s：%d 帧 / %d 骨%s，用时 %.1fs"
+                    % (src_name, frames, len(tracks), fix, time.time() - t0))
         return {"FINISHED"}
 
     def invoke(self, context, event):
@@ -920,7 +1244,7 @@ class HS2_OT_apply_hand_pose(bpy.types.Operator):
 class HS2_OT_add_rig(bpy.types.Operator):
     """生成 IK/FK 控制层（可重复执行：会先清掉旧的再重建）"""
     bl_idname = "hs2.add_rig"
-    bl_label = "3. 生成控制器"
+    bl_label = "生成控制器"
     bl_options = {"REGISTER", "UNDO"}
 
     follow: BoolProperty(name="控制器跟随当前动作", default=True)
@@ -1153,6 +1477,32 @@ class HS2_OT_export_fbx(bpy.types.Operator, ExportHelper):
         return {"FINISHED"}
 
 
+def _export_root_name(obj):
+    if obj.type != "ARMATURE" or not obj.data.bones.get("p_cf_anim"):
+        return None
+    return "p_cf_anim"
+
+
+@contextlib.contextmanager
+def _export_with_root(obj):
+    """FBX 的骨架根节点用 p_cf_anim，而不是对象名 HS2_Default。"""
+    root = _export_root_name(obj)
+    if not root or obj.name == root:
+        yield
+        return
+    if bpy.data.objects.get(root) not in (None, obj):
+        yield
+        return
+    old_obj, old_data = obj.name, obj.data.name
+    try:
+        obj.name = root
+        obj.data.name = root
+        yield
+    finally:
+        obj.name = old_obj
+        obj.data.name = old_data
+
+
 def _export(arm, path, include_mesh=False, deform_only=True, all_bones=False):
     if bpy.context.object is not None and bpy.context.object.mode != "OBJECT":
         bpy.ops.object.mode_set(mode="OBJECT")
@@ -1165,21 +1515,176 @@ def _export(arm, path, include_mesh=False, deform_only=True, all_bones=False):
                 ob.select_set(True)
     bpy.context.view_layer.objects.active = arm
 
-    bpy.ops.export_scene.fbx(
-        filepath=path, use_selection=True,
-        object_types={"ARMATURE", "MESH"},
-        apply_scale_options="FBX_SCALE_ALL",
-        use_mesh_modifiers=True, mesh_smooth_type="FACE",
-        add_leaf_bones=False,
-        use_armature_deform_only=deform_only,
-        primary_bone_axis="Y", secondary_bone_axis="X",
-        armature_nodetype="NULL",
-        bake_anim=True, bake_anim_use_all_bones=all_bones,
-        bake_anim_use_nla_strips=False, bake_anim_use_all_actions=False,
-        bake_anim_force_startend_keying=True, bake_anim_simplify_factor=0.0,
-        path_mode="COPY", embed_textures=False,
-    )
+    with _export_with_root(arm):
+        bpy.ops.export_scene.fbx(
+            filepath=path, use_selection=True,
+            object_types={"ARMATURE", "MESH"},
+            apply_scale_options="FBX_SCALE_ALL",
+            use_mesh_modifiers=True, mesh_smooth_type="FACE",
+            add_leaf_bones=False,
+            use_armature_deform_only=deform_only,
+            primary_bone_axis="Y", secondary_bone_axis="X",
+            armature_nodetype="NULL",
+            bake_anim=True, bake_anim_use_all_bones=all_bones,
+            bake_anim_use_nla_strips=False, bake_anim_use_all_actions=False,
+            bake_anim_force_startend_keying=True, bake_anim_simplify_factor=0.0,
+            path_mode="COPY", embed_textures=False,
+        )
     return path
+
+
+# --------------------------------------------------------------------------
+# 按物体导出 FBX（给 UE 用）
+# --------------------------------------------------------------------------
+
+# 轴向预设：UE / Unity 都吃 Y-up 的 FBX（它们导入时会自己转到 Z-up）
+AXIS_PRESETS = {
+    "ue": ("-Z", "Y"),
+    "unity": ("-Z", "Y"),
+    "blender": ("Y", "Z"),
+}
+
+
+def _has_object_curves(ob):
+    """这个物体的动画里有没有「物体级」曲线（location/rotation/scale）？
+
+    只有骨骼曲线时，物体自身的变换纯属「挂在哪」，导出前可以放心归零。
+    """
+    ad = getattr(ob, "animation_data", None)
+    if ad is None or ad.action is None:
+        return False
+    try:
+        curves = compat.bag(ad.action, ob) or []
+    except Exception:
+        return False
+    for fc in curves:
+        if not fc.data_path.startswith("pose.bones"):
+            return True
+    return False
+
+
+def _export_selection(path, axis="ue", deform_only=False, all_bones=True,
+                      frame_range=None):
+    fwd, up = AXIS_PRESETS.get(axis, AXIS_PRESETS["ue"])
+    scn = bpy.context.scene
+    old_range = (scn.frame_start, scn.frame_end)
+    if frame_range:
+        scn.frame_start, scn.frame_end = int(frame_range[0]), int(frame_range[1])
+    try:
+        with contextlib.ExitStack() as stack:
+            for ob in bpy.context.selected_objects:
+                if ob.type == "ARMATURE":
+                    stack.enter_context(_export_with_root(ob))
+            bpy.ops.export_scene.fbx(
+                filepath=path, use_selection=True,
+                object_types={"ARMATURE", "MESH"},
+                apply_scale_options="FBX_SCALE_ALL", global_scale=1.0,
+                use_mesh_modifiers=True, mesh_smooth_type="FACE",
+                add_leaf_bones=False,
+                use_armature_deform_only=deform_only,
+                primary_bone_axis="Y", secondary_bone_axis="X",
+                armature_nodetype="NULL",
+                axis_forward=fwd, axis_up=up,
+                bake_anim=True, bake_anim_use_all_bones=all_bones,
+                bake_anim_use_nla_strips=False, bake_anim_use_all_actions=False,
+                bake_anim_force_startend_keying=True, bake_anim_simplify_factor=0.0,
+                path_mode="COPY", embed_textures=False,
+            )
+    finally:
+        scn.frame_start, scn.frame_end = old_range
+    return path
+
+
+def object_action_range(ob):
+    ad = getattr(ob, "animation_data", None)
+    if ad is None or ad.action is None:
+        return None
+    try:
+        lo, hi = ad.action.frame_range
+        return int(round(lo)), int(round(hi))
+    except Exception:
+        return None
+
+
+def export_object(obj, path, axis="ue", include_mesh=True,
+                  deform_only=False, all_bones=True):
+    """把**一个**物体（连同它的蒙皮网格）导出成独立的 FBX。
+
+    要点（给 UE 用）：
+      * 先断开父级 —— 道具挂角色骨上时，父级的运动会漏进导出，变成
+        「物体自己也在动」，导入 UE 就成双份动画；
+      * 只有骨骼曲线时把物体变换归零，根节点落在原点、朝向干净；
+      * 骨架和动画用同一套骨骼轴向（Y/X），UE 侧导入骨架和动画才对得上；
+      * 1 Blender 米 = 1 FBX 单位，UE 导入默认缩放就是 175 cm 的人、20 cm 的道具。
+    """
+    if bpy.context.object is not None and bpy.context.object.mode != "OBJECT":
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+    saved = {
+        "parent": obj.parent,
+        "ptype": obj.parent_type,
+        "pbone": obj.parent_bone,
+        "pinv": obj.matrix_parent_inverse.copy(),
+        "basis": obj.matrix_basis.copy(),
+        "world": obj.matrix_world.copy(),
+    }
+    meshes = []
+    if include_mesh:
+        for ch in obj.children_recursive:
+            if ch.type == "MESH":
+                meshes.append((ch, ch.matrix_world.copy(), ch.parent))
+    rng = object_action_range(obj)
+
+    try:
+        bpy.ops.object.select_all(action="DESELECT")
+        has_obj_anim = _has_object_curves(obj)
+        if obj.parent is not None:
+            obj.parent = None
+            if not has_obj_anim:
+                obj.matrix_basis = Matrix.Identity(4)
+                obj.matrix_world = Matrix.Identity(4)
+            else:
+                obj.matrix_world = saved["world"]
+        elif not has_obj_anim:
+            obj.matrix_basis = Matrix.Identity(4)
+
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
+        for ch, _w, _p in meshes:
+            ch.select_set(True)
+        _export_selection(path, axis=axis, deform_only=deform_only,
+                          all_bones=all_bones, frame_range=rng)
+    finally:
+        # 还原父子关系和变换
+        obj.parent = saved["parent"]
+        if saved["parent"] is not None:
+            obj.parent_type = saved["ptype"]
+            obj.parent_bone = saved["pbone"]
+            obj.matrix_parent_inverse = saved["pinv"]
+        obj.matrix_basis = saved["basis"]
+        try:
+            bpy.context.view_layer.update()
+        except Exception:
+            pass
+    return path
+
+
+def export_objects(objs, outdir=None, prefix="", axis="ue",
+                   include_mesh=True):
+    """一批物体，每个导出成 <名字>.fbx。返回 [(物体名, 路径)]"""
+    import re
+    out = []
+    outdir = outdir or bpy.path.abspath("//") or os.getcwd()
+    os.makedirs(outdir, exist_ok=True)
+    for ob in objs:
+        safe = re.sub(r'[<>:"/\\|?*]', "_", ob.name)
+        path = os.path.join(outdir, "%s%s.fbx" % (prefix, safe))
+        try:
+            export_object(ob, path, axis=axis, include_mesh=include_mesh)
+            out.append((ob.name, path))
+        except Exception as e:
+            print("[HS2] 导出 %s 失败：%s" % (ob.name, e))
+    return out
 
 
 class HS2_OT_batch_export(bpy.types.Operator):
@@ -1279,7 +1784,6 @@ CLASSES = (
     HS2_OT_load_default,
     HS2_OT_add_head,
     HS2_OT_scan_clips,
-    HS2_OT_clip_step,
     HS2_OT_show_in_front,
     HS2_OT_toggle_jointfix,
     HS2_OT_import_clip,

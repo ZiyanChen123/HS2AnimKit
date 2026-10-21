@@ -229,9 +229,10 @@ def pose_count(game_dir):
 
 def enum_items(game_dir):
     n = pose_count(game_dir)
-    out = [("-1", "无（还原）", "清除手势，恢复手指骨静止")]
+    out = [("-1", "无（还原）", "手势：无（还原）\n清除手指姿势，恢复静止")]
     for i in range(n):
-        out.append((str(i), "姿势 %02d" % (i + 1),
-                    "工作室第 %d/%d 个手势（游戏数据里没有名字）"
-                    % (i + 1, n)))
+        label = "手势 %02d" % (i + 1)
+        out.append((str(i), label,
+                    "%s\n工作室 cf_anmShapeHand 第 %d/%d 个手指姿势"
+                    % (label, i + 1, n)))
     return out

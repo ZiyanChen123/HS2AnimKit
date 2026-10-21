@@ -18,7 +18,7 @@ def _mat(m):
 
 
 def apply_clip(arm_obj, skel, names, clip, scale=None, action_name=None,
-               start_frame=1):
+               start_frame=0):
     """生成 Action 并挂到 arm_obj 上。返回 (action, info)。"""
     scale = scale if scale is not None else float(arm_obj.get("hs2_scale", 0.1))
     n = clip.frame_count

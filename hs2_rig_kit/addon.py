@@ -1,9 +1,31 @@
 """Blender 插件部分：注册面板、偏好设置、操作符。"""
 
+import os
+
 import bpy
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, StringProperty
 
-from . import ops, rig, ui
+from . import ops, ops2, rig, ui
+
+
+def _ver_text():
+    from . import bl_info
+    mod = __import__(__package__, fromlist=["x"])
+    f = getattr(mod, "__file__", "") or ""
+    v = ".".join(str(x) for x in bl_info.get("version", (0,)))
+    return "HS2 Anim Kit v%s · %s" % (v, os.path.dirname(os.path.dirname(f)) if f else "?")
+
+
+def _on_game_dir(self, context):
+    """换目录：把解包器缓存和面板列表都清掉，免得拿旧数据。"""
+    ops._ASSETS.clear()
+    ops.STATE.pop("game", None)
+    ops.STATE.pop("index", None)
+    try:
+        from . import ops2
+        ops2.invalidate_lists()
+    except Exception:
+        pass
 
 
 class HS2Preferences(bpy.types.AddonPreferences):
@@ -14,6 +36,7 @@ class HS2Preferences(bpy.types.AddonPreferences):
         subtype="DIR_PATH",
         default="",
         description="含 abdata/chara/oo_base.unity3d 的目录",
+        update=_on_game_dir,
     )
     include_head: BoolProperty(
         name="加载默认角色时带头部",
@@ -31,48 +54,32 @@ class HS2Preferences(bpy.types.AddonPreferences):
         layout.prop(self, "include_head")
         layout.label(text="解包器已内置，不需要额外装 Python 包。", icon="INFO")
 
+        layout.separator()
+        row = layout.row(align=True)
+        row.label(text=_ver_text(), icon="SCRIPT")
+        row.operator("hs2.reload", text="重载插件代码", icon="FILE_REFRESH")
+        layout.label(text="改过插件代码才需要重载；平时改动作不用。", icon="NONE")
+
 
 # --------------------------------------------------------------------------
 # 动作滑条：用 0~1 的进度值，长度随列表自动缩放
 # --------------------------------------------------------------------------
 
-def _on_clip_pos(self, context):
-    """滑条动了 → 记住名字；开着「自动加载」就排一次导入（防抖，停手才读）。"""
-    i, names = ops.clip_index(context)
-    if not names:
-        return
-    self.hs2_clip_name = names[i]
-    if getattr(self, "hs2_clip_auto", True) and ops.current_arm() is not None:
-        ops.schedule_clip_load(names[i])
-
-
-def _on_clip_enum(self, context):
-    """下拉框选了动作 → 记住名字、同步滑条位置、按需自动加载。"""
-    name = (self.hs2_clip_enum or "").strip()
-    if not name:
-        return
-    self.hs2_clip_name = name
-    names = ops.clip_list(context)
-    if len(names) > 1 and name in names:
-        self.hs2_clip_pos = names.index(name) / float(len(names) - 1)
-    if getattr(self, "hs2_clip_auto", True) and ops.current_arm() is not None:
-        ops.schedule_clip_load(name, delay=0.05)
-
-
-def _on_clip_filter(self, context):
-    self.hs2_clip_pos = 0.0
-    names = ops.clip_list(context)
-    self.hs2_clip_name = names[0] if names else ""
-    ops.clear_enum_cache()
-    if getattr(self, "hs2_clip_auto", True) and names and ops.current_arm() is not None:
-        ops.schedule_clip_load(names[0])
+_HAND_FALLBACK = [("-1", "无（还原）", "")]
+_HAND_CACHE = {"key": None, "items": _HAND_FALLBACK}
 
 
 def _hand_items(self, context):
     try:
-        return ops.handpose.enum_items(ops.game_dir_of(context))
+        g = ops.game_dir_of(context)
+        n = ops.handpose.pose_count(g)
+        key = (g, n)
+        if _HAND_CACHE["key"] != key:
+            _HAND_CACHE["key"] = key
+            _HAND_CACHE["items"] = ops.handpose.enum_items(g)
+        return _HAND_CACHE["items"]
     except Exception:
-        return [("-1", "无（还原）", "")]
+        return _HAND_CACHE["items"]
 
 
 def _hand_preview(scene, context, side):
@@ -123,23 +130,6 @@ STUDIO_FIELDS = (
 def register():
     bpy.utils.register_class(HS2Preferences)
 
-    bpy.types.Scene.hs2_clip_pos = FloatProperty(
-        name="进度", default=0.0, min=0.0, max=1.0, precision=4,
-        options={"SKIP_SAVE"}, update=_on_clip_pos,
-        description="拖动选择动作（按当前过滤结果按比例对应）")
-    bpy.types.Scene.hs2_clip_name = StringProperty(name="动作名", default="",
-                                                   options={"SKIP_SAVE"})
-    bpy.types.Scene.hs2_clip_filter = StringProperty(
-        name="过滤", default="", options={"SKIP_SAVE"},
-        description="按名字过滤动作（不区分大小写的子串）",
-        update=_on_clip_filter)
-    bpy.types.Scene.hs2_clip_auto = BoolProperty(
-        name="切换动作时自动加载", default=True,
-        description="拖动滑条 / 点 ◀▶ 停手 0.35 秒后自动把动作装进来，"
-                    "不用再点「导入」")
-    bpy.types.Scene.hs2_clip_enum = EnumProperty(
-        name="动作", items=ops.clip_enum_items, update=_on_clip_enum,
-        description="下拉选择动作（点开可以直接打字搜索）")
     bpy.types.Scene.hs2_hand_L = EnumProperty(
         name="左手势", items=_hand_items, update=_on_hand_L,
         description="工作室 cf_anmShapeHand 的 21 个手势（选择即预览，只写手指骨）")
@@ -165,17 +155,17 @@ def register():
 
     for c in ops.CLASSES:
         bpy.utils.register_class(c)
+    ops2.register()
     ui.register()
 
 
 def unregister():
     ui.unregister()
+    ops2.unregister()
     for c in reversed(ops.CLASSES):
         bpy.utils.unregister_class(c)
     ops._clear_pending()
-    for attr in ("hs2_clip_pos", "hs2_clip_name", "hs2_clip_filter",
-                 "hs2_clip_auto", "hs2_clip_enum", "hs2_hand_L", "hs2_hand_R",
-                 "hs2_hand_key"):
+    for attr in ("hs2_hand_L", "hs2_hand_R", "hs2_hand_key", "hs2_arm_tilt"):
         if hasattr(bpy.types.Scene, attr):
             delattr(bpy.types.Scene, attr)
     for attr in ("hs2_jointfix",) + tuple(p for p, _g in STUDIO_FIELDS):
