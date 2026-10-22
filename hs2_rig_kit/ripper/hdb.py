@@ -25,6 +25,7 @@ HS2 的 H 动画不在 `studio/anime` 里，而是按「场景 × 类型 × 番�
 import os
 import re
 
+from .. import jpcn as _jpcn
 from . import unityfs
 
 # 阶段名（clip 名去掉 S/M/L 速度前缀和 D_ 变体前缀后）→ 中文
@@ -1411,6 +1412,7 @@ def build(game_dir, roles=("female", "male", "item"), progress=None):
         if not m["label"]:
             m["label"] = "%s %d" % (m["type_jp"], m["id"])
         out.append(m)
+    _jpcn.localize_modes(out)
     return {"game_dir": game_dir, "modes": out, "ctrls": ctrls}
 
 

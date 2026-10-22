@@ -31,6 +31,12 @@ def _arm(context):
 
 def _safe(fn):
     def wrap(self, context):
+        # 面板真的在画才让定时器去读目录/刷列表（启动时不碰游戏数据）
+        try:
+            from . import ops2
+            ops2.note_panel_draw()
+        except Exception:
+            pass
         try:
             fn(self, context)
         except Exception as e:
@@ -82,21 +88,13 @@ def draw_variant_selector(layout, context):
         return
 
 
-def draw_actor_selector(layout, context):
-    """在「调整」顶部放一排演员按钮：点哪个，下面所有工具就编辑哪个。
-
-    H 动作多人的时候，手势 / IK / 动作后处理都只对当前选中的演员生效。
-    按钮只显示槽位名（女1/男1/女2/男2），多人也放得下。
-    3 人以上用 grid_flow 避免按钮溢出侧栏。
-    """
+def draw_actor_buttons(box, context):
+    """共享的「编辑对象」按钮；返回 (chars, active)。"""
     from . import api
     chars = api.characters()
     if not chars:
-        box = layout.box()
-        draw_variant_selector(box, context)
-        return
-    box = layout.box()
-    box.label(text="编辑对象（点切换）", icon="ARMATURE_DATA")
+        return chars, None
+    box.label(text="编辑对象", icon="ARMATURE_DATA")
     n = len(chars)
     if n >= 3:
         grid = box.grid_flow(row_major=True, columns=n, align=True)
@@ -116,7 +114,36 @@ def draw_actor_selector(layout, context):
         label = api.SLOT_CN.get(slot, slot) if slot else active.name
         row = box.row(align=True)
         row.label(text="当前：%s" % label, icon="RESTRICT_SELECT_OFF")
+    return chars, active
+
+
+def draw_actor_selector(layout, context):
+    """动画页的「编辑对象」：切换演员 + 体型档位 + 导出当前动作。"""
+    from . import api
+    chars = api.characters()
+    if not chars:
+        box = layout.box()
+        draw_variant_selector(box, context)
+        return
+    box = layout.box()
+    chars, active = draw_actor_buttons(box, context)
     draw_variant_selector(box, context)
+
+    # 只导「当前这个人 + 当前这条动作」，不带网格 —— 给 UE/Unity 用最干净
+    if active is not None:
+        act = (active.animation_data.action
+               if active.animation_data is not None else None)
+        box.separator()
+        row = box.row(align=True)
+        row.scale_y = 1.3
+        row.enabled = act is not None
+        op = row.operator("hs2.export_char_anim",
+                          text="导出当前角色动画", icon="EXPORT")
+        op.name = active.name
+        if act is None:
+            box.label(text="这个角色还没有动作", icon="INFO")
+        else:
+            box.label(text="当前动作：%s · 仅动画" % act.name, icon="ACTION")
 
 
 # --------------------------------------------------------------------------
@@ -178,6 +205,11 @@ class HS2_PT_main(bpy.types.Panel):
 
         layout.prop(scn, "hs2_tab", expand=True)
 
+        if scn.hs2_tab == "CLOTH":
+            from . import clothui
+            clothui.draw_page(layout, context)
+            return
+
         if scn.hs2_tab == "STUDIO":
             self.draw_studio(context, layout, scn, api, ops2)
         else:
@@ -235,8 +267,7 @@ class HS2_PT_main(bpy.types.Panel):
     # ---- 状态提示 ----
     def draw_scanning(self, layout):
         box = layout.box()
-        box.label(text="正在建立动作库索引…", icon="TIME")
-        box.label(text="第一次大约 30 秒，之后秒开", icon="NONE")
+        box.label(text="正在建立动作库索引…（首次约 30 秒）", icon="TIME")
 
     def draw_empty(self, layout, api):
         box = layout.box()
@@ -247,7 +278,6 @@ class HS2_PT_main(bpy.types.Panel):
         op = box.operator("hs2.scan_clips", text="现在建索引",
                           icon="FILE_REFRESH")
         op.rebuild = True
-        box.label(text="一般不用点：第一次用会自己建", icon="NONE")
 
 
 # --------------------------------------------------------------------------
@@ -262,6 +292,10 @@ class HS2_PT_edit(bpy.types.Panel):
     bl_category = "HS2"
     bl_parent_id = "HS2_PT_main"
 
+    @classmethod
+    def poll(cls, context):
+        return getattr(context.scene, "hs2_tab", "STUDIO") != "CLOTH"
+
     @_safe
     def draw(self, context):
         layout = self.layout
@@ -271,8 +305,7 @@ class HS2_PT_edit(bpy.types.Panel):
         arm = _arm(context)
         if arm is None:
             draw_actor_selector(layout, context)
-            layout.label(text="先在「动作」里点一条动作（没有演员会自动上场）",
-                         icon="INFO")
+            layout.label(text="先点一条动作", icon="INFO")
             return
 
         # 多人场景：先确认正在编辑谁（下面所有工具都只针对这个演员）
@@ -378,10 +411,6 @@ class HS2_PT_edit(bpy.types.Panel):
             row.operator("hs2.apply_hand_pose", text="还原",
                          icon="LOOP_BACK").mode = "RESET"
 
-        # ---- 导出提示（就一句话，不放按钮）----
-        layout.label(text="导出：选中骨架 → 文件 → 导出 → FBX（勾「仅变形骨」）",
-                     icon="INFO")
-
 
 # --------------------------------------------------------------------------
 # 外部动作（另一种用法：自己带动作进来）
@@ -395,6 +424,10 @@ class HS2_PT_ext(bpy.types.Panel):
     bl_category = "HS2"
     bl_parent_id = "HS2_PT_main"
     bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return getattr(context.scene, "hs2_tab", "STUDIO") != "CLOTH"
 
     @_safe
     def draw(self, context):

@@ -5,7 +5,7 @@ import os
 import bpy
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, StringProperty
 
-from . import ops, ops2, rig, ui
+from . import clothops, clothui, ops, ops2, rig, ui
 
 
 def _ver_text():
@@ -156,11 +156,15 @@ def register():
     for c in ops.CLASSES:
         bpy.utils.register_class(c)
     ops2.register()
+    clothops.register()
     ui.register()
+    clothui.register()
 
 
 def unregister():
+    clothui.unregister()
     ui.unregister()
+    clothops.unregister()
     ops2.unregister()
     for c in reversed(ops.CLASSES):
         bpy.utils.unregister_class(c)

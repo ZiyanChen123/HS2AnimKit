@@ -17,7 +17,7 @@ import time
 
 import bpy
 
-from . import animlib, ops, props, rig
+from . import animlib, jpcn, ops, props, rig
 from .ripper import GameAssets, hdb
 
 STATE = ops.STATE
@@ -82,7 +82,7 @@ def character(gender="female", head=True, generic=False, cleanup=True,
             obj_name = "%s_%s_%s" % (ops.ARM_NAME, gender[0].upper(), want)
         else:
             obj_name = ops.ARM_NAME if want == "f1" else (
-                "HS2_Default_Male" if want == "m1" else
+                "Armature_Male" if want == "m1" else
                 "%s_%s" % (ops.ARM_NAME, want))
     if gender == "male":
         arm_obj, names, body, head_obj = ops.build_default(
@@ -119,7 +119,7 @@ def categories(include_h=True):
             hh = out.setdefault("h", {}).setdefault("H 场景动作", [])
             for m in h["modes"]:
                 if m.get("roles"):
-                    hh.append(m.get("label") or m["key"])
+                    hh.append(jpcn.label_of(m))
     return out
 
 
@@ -148,17 +148,22 @@ def search(keyword="", kind="all", group=None, limit=200, min_fit=None):
         for m in h.get("modes") or []:
             if not m.get("roles"):
                 continue
-            label = m.get("label") or ""
-            if kw and kw not in label.lower() and kw not in m["type"].lower() \
-                    and kw not in (m.get("type_jp") or ""):
+            label = jpcn.label_of(m)
+            label_jp = m.get("label_jp") or m.get("label") or ""
+            type_jp = m.get("type_jp") or ""
+            type_cn = m.get("type_cn") or ""
+            if kw and kw not in label.lower() and kw not in label_jp.lower() \
+                    and kw not in m["type"].lower() \
+                    and kw not in type_jp.lower() and kw not in type_cn.lower():
                 continue
             out.append({"name": label, "kind": "h", "key": m["key"],
-                        "type": m["type"], "type_jp": m.get("type_jp", ""),
+                        "type": m["type"], "type_jp": type_jp,
+                        "type_cn": type_cn, "label_jp": label_jp,
                         "props": [p.get("prefab") for p in m.get("props") or []],
                         "roles": list(m.get("roles") or {}),
                         "category": "%s/%s" % (m["type"], m["pack"]),
                         "group": m["type"],
-                        "group_cn": m.get("type_jp", "")})
+                        "group_cn": type_cn or type_jp})
     if kw:
         out.sort(key=lambda e: (0 if e["name"].lower().startswith(kw) else 1,
                                 len(e["name"])))
@@ -166,7 +171,7 @@ def search(keyword="", kind="all", group=None, limit=200, min_fit=None):
 
 
 def find_mode(text):
-    """按日文名 / id / key 找 H 模式。"""
+    """按中文名 / 日文名 / id / key 找 H 模式。"""
     h = h_data()
     modes = [m for m in (h.get("modes") or []) if m.get("roles")]
     t = (text or "").strip()
@@ -176,10 +181,14 @@ def find_mode(text):
         if m.get("key") == t:
             return m
     for m in modes:
-        if (m.get("label") or "") == t:
+        if t in (m.get("label") or "", m.get("label_jp") or "",
+                 m.get("label_cn") or ""):
             return m
     low = t.lower()
-    hits = [m for m in modes if low in (m.get("label") or "").lower()]
+    hits = [m for m in modes
+            if low in (m.get("label") or "").lower()
+            or low in (m.get("label_jp") or "").lower()
+            or low in (m.get("label_cn") or "").lower()]
     if hits:
         return hits[0]
     if t.isdigit():
@@ -356,7 +365,7 @@ def characters():
 
 
 def active_character():
-    """当前要操作的角色：选中的 > 激活的 > HS2_Default > 第一个。"""
+    """当前要操作的角色：选中的 > 激活的 > 女1 > 第一个。"""
     try:
         ob = bpy.context.view_layer.objects.active
         if _alive(ob) and ob.type == "ARMATURE" and ob.get("hs2_slot"):
@@ -448,6 +457,14 @@ def setup_cast(mode):
         char = character(gender, slot=slot)
         added.append(slot)
         chars[slot] = char
+    # H 场景里的男性生殖器：这段动作有男角就补，没有就摘掉。
+    for slot, char in chars.items():
+        if hdb.slot_gender(slot) != "male":
+            continue
+        if slot in need:
+            ops.ensure_male_genital(char)
+        else:
+            ops.remove_male_genital(char)
     return {"slots": need, "added": added, "chars": chars}
 
 
@@ -496,7 +513,7 @@ def apply_h(mode, stage=None, target=None, slot=None, with_props=True,
             letter = avail[len(avail) // 2] if avail else list(group["variants"])[0]
 
     clip = _pick_group_clip(group, letter, fps=fps)
-    aname = "H_%s_%s_%s" % (m.get("label") or m["id"], group["label"], slot)
+    aname = "H_%s_%s_%s" % (jpcn.label_of(m) or m["id"], group["label"], slot)
     act, info = ops.apply_clip_data(char, clip, aname, follow=follow)
     _remember(act.name)
 
@@ -528,6 +545,8 @@ def apply_h(mode, stage=None, target=None, slot=None, with_props=True,
     if with_props:
         out["props"] = load_mode_props(m, stage=group, char_slot=slot,
                                        height=h_letter, bust=b_letter)
+    if gender_of(char) == "male" and slot in (m.get("roles") or {}):
+        ops.ensure_male_genital(char)
     return out
 
 
@@ -547,6 +566,8 @@ def load_h(mode, stage=None, roles=None, fps=None, follow=True,
     if target is not None:
         res = apply_h(m, stage, target=target, with_props=with_props, fps=fps,
                       follow=follow, height=height, bust=bust)
+        if gender_of(target) == "male":
+            ops.ensure_male_genital(target)
         return {"mode": m, "actions": {res["slot"]: res["action"]},
                 "info": {res["slot"]: res["info"]}, "stage": res["stage"],
                 "stages": res["stages"], "props": res["props"]}
@@ -583,6 +604,15 @@ def load_h(mode, stage=None, roles=None, fps=None, follow=True,
             first_char.get("hs2_h_letter") if first_char else "M") or "M"
         out["props"] = load_mode_props(m, stage=out["stage"],
                                        height=letter, bust=letter)
+    # 有男角就补生殖器；没有的男角色摘掉
+    need = set((m.get("roles") or {}).keys())
+    for slot, char in chars.items():
+        if hdb.slot_gender(slot) != "male":
+            continue
+        if slot in need:
+            ops.ensure_male_genital(char)
+        else:
+            ops.remove_male_genital(char)
     return out
 
 
@@ -1088,7 +1118,7 @@ def set_stage(stage):
     if m is None:
         raise RuntimeError("当前不是 H 动作，没法切阶段")
     apply_stage_all(m, stage)
-    return m.get("label")
+    return jpcn.label_of(m)
 
 
 def ensure_actor(gender="female"):
@@ -1152,7 +1182,7 @@ def sync_state(mode=None):
                 SLOT_CN.get(slot, slot), "女" if want == "female" else "男",
                 "女" if got == "female" else "男")
 
-    return True, "%s（%s）已就位，可以联动" % (m.get("label"),
+    return True, "%s（%s）已就位，可以联动" % (jpcn.label_of(m),
                                               hdb.cast_text(m.get("roles") or {}))
 
 
@@ -1186,7 +1216,7 @@ def sync_stage(stage=None, mode=None, force=False, height=None, bust=None):
         done.append("%s→%s" % (SLOT_CN.get(slot, slot),
                                res["stage"]["cn"]))
     props_done = _apply_prop_stage(m)
-    return "%s ｜ %s%s" % (m.get("label"), "、".join(done),
+    return "%s ｜ %s%s" % (jpcn.label_of(m), "、".join(done),
                            ("，道具 %d" % props_done) if props_done else "")
 
 
@@ -1389,7 +1419,7 @@ def _one(line):
                 res = load_h_fresh(mode, stage)
                 info = res.get("info") or {}
                 msg = "H 动作：%s · %s（%d 人）" % (
-                    res["mode"]["label"], res.get("stage", {}).get("cn", "?"),
+                    jpcn.label_of(res["mode"]), res.get("stage", {}).get("cn", "?"),
                     len(characters())) if info or res.get("reused") else "没装上"
                 if res["props"]:
                     msg += "，道具 %d 个" % len(res["props"])
@@ -1397,7 +1427,7 @@ def _one(line):
             kw = args[0] if args else ""
             res = search(kw, kind="h")
             return "\n".join("%-14s %-6s 道具=%s" % (
-                e["name"], e["type_jp"], ",".join(p for p in e["props"] if p) or "-")
+                e["name"], e["type_cn"] or e["type_jp"], ",".join(p for p in e["props"] if p) or "-")
                 for e in res[:40]) or "没有匹配"
         if op in ("stages", "stage"):
             m = find_mode(args[0] if args else "")
@@ -1405,7 +1435,7 @@ def _one(line):
                 return "没找到这段 H 动作"
             st = stages(m)
             return "%s 有 %d 个阶段：\n%s" % (
-                m["label"], len(st), "\n".join(
+                jpcn.label_of(m), len(st), "\n".join(
                     "  %-14s %s" % (s["name"], s["cn"]) for s in st))
         if op in ("h1", "hsel"):
             m = find_mode(args[0]) if args else None
@@ -1416,7 +1446,7 @@ def _one(line):
                 return "先加载角色"
             res = apply_h(m, args[1] if len(args) > 1 else None, target=char)
             return "已装到 %s：%s · %s（%d 帧）%s" % (
-                SLOT_CN.get(res["slot"], res["slot"]), m["label"],
+                SLOT_CN.get(res["slot"], res["slot"]), jpcn.label_of(m),
                 res["stage"]["cn"], res["info"]["frames"],
                 "，道具 %d" % len(res["props"]) if res["props"] else "")
         if op == "sync":

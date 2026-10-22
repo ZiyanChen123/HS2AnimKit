@@ -53,7 +53,7 @@ def _length_for(skel, i, world, heads):
     return max(best, 0.012)
 
 
-def build_armature(skel, name="HS2_Default", scale=0.1, collection=None,
+def build_armature(skel, name="Armature", scale=0.1, collection=None,
                    extra=None):
     """建骨架。extra 是额外骨骼（头部/面部），world 已经是骨架空间（Unity）。
 

@@ -50,7 +50,25 @@ class Skeleton(object):
         return len(self.bones)
 
     def index_of(self, path):
-        return self.by_path.get(path)
+        if not path:
+            return None
+        p = str(path).replace("\\", "/")
+        # 衣服 prefab 有时会把骨架挂在自己的模型根下（c_00/cf_J_Root/...），
+        # 默认骨架是从 cf_J_Root 开始的，先剥掉模型根前缀再查。
+        i = p.find("cf_J_Root/")
+        if i >= 0:
+            p = p[i:]
+        elif p.startswith("c_00/"):
+            p = p[5:]
+        idx = self.by_path.get(p)
+        if idx is not None:
+            return idx
+        # 少数旧裙摆层级（cf_J_LegUp01_R/...）只能按唯一叶子名对。
+        leaf = p.rsplit("/", 1)[-1]
+        matches = self.by_name.get(leaf) or []
+        if len(matches) == 1:
+            return matches[0]
+        return None
 
     def duplicates(self):
         return {n: v for n, v in self.by_name.items() if len(v) > 1}

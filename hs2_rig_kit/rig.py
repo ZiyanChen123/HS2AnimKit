@@ -1294,7 +1294,19 @@ def _limb_targets(arm, side, is_leg):
 
 
 def key_targets(arm, start=None, end=None):
-    """把 FK 控制骨 + IK 目标逐帧钉在当前动作上（一次遍历，批量写曲线）。"""
+    """把控制器逐帧钉到动作上。
+
+    第一遍是在约束刚建好、控制器还没有曲线时采样，Blender 对首帧的
+    求值会慢一拍；第二遍在控制器曲线已经存在后重采，首帧（第 0 帧）
+    才会和后面完全一致。两遍都写同一批曲线，第二遍覆盖第一遍。
+    """
+    n = _key_targets_once(arm, start, end)
+    if n:
+        n = _key_targets_once(arm, start, end)
+    return n
+
+
+def _key_targets_once(arm, start=None, end=None):
     if not has_rig(arm):
         return 0
     if arm.animation_data is None or arm.animation_data.action is None:
@@ -1319,8 +1331,14 @@ def key_targets(arm, start=None, end=None):
 
     _mute_rig(arm, True)
     try:
+        # 静音约束后必须刷新一次；否则第一帧读到的是绑定前的旧姿势。
+        arm.update_tag()
+        bpy.context.view_layer.update()
+        bpy.context.evaluated_depsgraph_get().update()
         for f in range(start, end + 1):
             scn.frame_set(f)
+            bpy.context.view_layer.update()
+            bpy.context.evaluated_depsgraph_get().update()
             worlds = {}
             for cname, bone, parent in ctrls:
                 pb = arm.pose.bones.get(bone)

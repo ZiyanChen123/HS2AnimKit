@@ -19,7 +19,7 @@ from .ripper import mesh as _mesh
 _ASSETS = {}
 STATE = {}
 
-ARM_NAME = "HS2_Default"
+ARM_NAME = "Armature"
 BODY_NAME = "HS2_Body"
 HEAD_NAME = "HS2_Head"
 
@@ -93,7 +93,7 @@ def current_arm():
         if _is_arm(sel):
             return sel
     arm = bpy.data.objects.get(ARM_NAME)
-    if arm is not None and arm.type == "ARMATURE":
+    if _is_arm(arm):
         return arm
     for ob in bpy.data.objects:
         if ob.type == "ARMATURE" and ob.data.bones.get("cf_J_Root"):
@@ -119,9 +119,18 @@ def _tag_redraw(context):
 
 
 def remove_character(arm):
-    """删角色：骨架 + 它自己的身体/头部网格（不动别的角色）。"""
+    """删角色：骨架 + 它自己的身体/头部网格 + 身上的衣服（不动别的角色）。"""
     if arm is None:
         return False
+    try:
+        from . import clothes as _clothes
+        _clothes.clear_character(arm)
+    except Exception:
+        pass
+    try:
+        remove_male_genital(arm)
+    except Exception:
+        pass
     for key in ("hs2_body", "hs2_head"):
         nm = arm.get(key)
         if nm:
@@ -161,6 +170,86 @@ def _remove_object(name):
                 bpy.data.armatures.remove(data)
             elif isinstance(data, bpy.types.Mesh):
                 bpy.data.meshes.remove(data)
+
+
+def _genital_material():
+    mat = bpy.data.materials.get("HS2_MaleGenitalSkin")
+    if mat is not None:
+        return mat
+    mat = bpy.data.materials.new("HS2_MaleGenitalSkin")
+    mat.use_nodes = True
+    bsdf = next((n for n in mat.node_tree.nodes
+                 if n.type == "BSDF_PRINCIPLED"), None)
+    if bsdf is not None:
+        bsdf.inputs["Base Color"].default_value = (0.82, 0.64, 0.55, 1.0)
+        bsdf.inputs["Roughness"].default_value = 0.55
+    mat.diffuse_color = (0.82, 0.64, 0.55, 1.0)
+    return mat
+
+
+def has_male_genital(arm):
+    if arm is None:
+        return False
+    name = arm.get("hs2_genital_coll")
+    return bool(name and bpy.data.collections.get(name))
+
+
+def ensure_male_genital(arm):
+    """H 场景里给男角色补上 oo_base 的 cm_o_dan00 / cm_o_dan_f。"""
+    if arm is None or arm.get("hs2_gender") != "male":
+        return None
+    if has_male_genital(arm):
+        return bpy.data.collections.get(arm.get("hs2_genital_coll"))
+    try:
+        g = STATE.get("game") or get_assets(game_dir_from_arm(arm))
+        items = g.male_genital() if g is not None else []
+    except Exception as e:
+        print("[HS2] 男性生殖器加载失败：%s" % e)
+        return None
+    if not items:
+        return None
+    skel = STATE.get("skel") or g.skeleton()
+    names = bdata._unique_names(skel)
+    coll = bpy.data.collections.new("HS2_Genital_" + arm.name)
+    bpy.context.scene.collection.children.link(coll)
+    mat = _genital_material()
+    scale = float(arm.get("hs2_scale") or 0.1)
+    for item in items:
+        md = dict(item["mesh"])
+        md["flip"] = _mesh.needs_flip(md)
+        obj = bdata.build_mesh(
+            md, skel, names, arm,
+            name="HS2_Penis_%s_%s" % (arm.name, item["name"]),
+            scale=scale, collection=coll)
+        obj.data.materials.append(mat)
+        obj["hs2_genital"] = True
+        obj["hs2_genital_for"] = arm.name
+    arm["hs2_genital_coll"] = coll.name
+    return coll
+
+
+def remove_male_genital(arm):
+    if arm is None:
+        return
+    name = arm.get("hs2_genital_coll")
+    coll = bpy.data.collections.get(name) if name else None
+    if coll is None:
+        prefix = "HS2_Genital_" + arm.name
+        for c in bpy.data.collections:
+            if c.name == prefix or c.name.startswith(prefix + "."):
+                coll = c
+                break
+    if coll is not None:
+        for obj in list(coll.objects):
+            _remove_object(obj.name)
+        try:
+            bpy.data.collections.remove(coll)
+        except Exception:
+            pass
+    try:
+        del arm["hs2_genital_coll"]
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -204,6 +293,34 @@ def free_slot(gender):
     return None
 
 
+def base_gray_material():
+    """素模用的中性灰材质，避免身体/头是纯白，衣服颜色看不准。"""
+    mat = bpy.data.materials.get("HS2_BaseGray")
+    if mat is not None:
+        return mat
+    mat = bpy.data.materials.new("HS2_BaseGray")
+    mat.use_nodes = True
+    bsdf = next((n for n in mat.node_tree.nodes
+                 if n.type == "BSDF_PRINCIPLED"), None)
+    gray = (0.28, 0.28, 0.28, 1.0)
+    if bsdf is not None:
+        bsdf.inputs["Base Color"].default_value = gray
+        try:
+            bsdf.inputs["Roughness"].default_value = 0.55
+        except Exception:
+            pass
+    mat.diffuse_color = gray
+    return mat
+
+
+def _apply_base_gray(obj):
+    if obj is None or obj.type != "MESH":
+        return
+    mat = base_gray_material()
+    obj.data.materials.clear()
+    obj.data.materials.append(mat)
+
+
 def build_default(g, include_head=True, scale=0.1, cleanup=True,
                   body_mesh_name=None, name=None, gender="female", slot=None):
     """加载默认角色（骨架 + 身体 + 头）。
@@ -231,11 +348,14 @@ def build_default(g, include_head=True, scale=0.1, cleanup=True,
     if arm_name == ARM_NAME:
         body_name, head_name = BODY_NAME, HEAD_NAME
     else:
-        tail = arm_name.replace("HS2_Default", "").strip("_") or "x"
+        tail = arm_name.replace("Armature", "").strip("_") or "x"
         body_name = "%s_%s" % (BODY_NAME, tail)
         head_name = "%s_%s" % (HEAD_NAME, tail)
     if cleanup:
-        for nm in (arm_name, body_name, head_name):
+        # 骨架名现在是很通用的 "Armature"，别把场景里别人同名的骨架当成旧的删掉
+        if _is_arm(bpy.data.objects.get(arm_name)):
+            _remove_object(arm_name)
+        for nm in (body_name, head_name):
             _remove_object(nm)
 
     extra = None
@@ -254,6 +374,7 @@ def build_default(g, include_head=True, scale=0.1, cleanup=True,
     arm["hs2_head"] = head_name
     body = bdata.build_mesh(data, skel, names, arm, name=body_name,
                             scale=scale)
+    _apply_base_gray(body)
 
     head_obj = None
     if head:
@@ -261,6 +382,7 @@ def build_default(g, include_head=True, scale=0.1, cleanup=True,
         hd["group_names"] = hd.get("bone_names") or []
         head_obj = bdata.build_mesh(hd, skel, names, arm, name=head_name,
                                     scale=scale, xform=head["attach"])
+        _apply_base_gray(head_obj)
 
     STATE.update(names=names, skel=skel, arm=arm, mesh=body, head=head_obj,
                  game=g, scale=scale)
@@ -294,9 +416,9 @@ class HS2_OT_load_default(bpy.types.Operator):
             self.report({"ERROR"}, "已经是两个%s角色了" % (
                 "男" if self.male else "女",))
             return {"CANCELLED"}
-        name = {"f1": ARM_NAME, "m1": "HS2_Default_Male",
-                "f2": "HS2_Default_f2", "m2": "HS2_Default_m2"}.get(
-                    slot, "HS2_Default_" + slot)
+        name = {"f1": ARM_NAME, "m1": "Armature_Male",
+                "f2": "Armature_f2", "m2": "Armature_m2"}.get(
+                    slot, "Armature_" + slot)
         try:
             arm, names, body, head_obj = build_default(
                 g, include_head=self.include_head, scale=self.scale,
@@ -353,8 +475,10 @@ class HS2_OT_add_head(bpy.types.Operator):
 
         hd = dict(head["mesh"])
         hd["group_names"] = hd.get("bone_names") or []
-        bdata.build_mesh(hd, STATE.get("skel"), STATE.get("names") or [], arm,
-                         name=HEAD_NAME, scale=scale, xform=head["attach"])
+        head_obj = bdata.build_mesh(
+            hd, STATE.get("skel"), STATE.get("names") or [], arm,
+            name=HEAD_NAME, scale=scale, xform=head["attach"])
+        _apply_base_gray(head_obj)
         self.report({"INFO"}, "头部：%d 根骨，%d 顶点"
                     % (len(extra), len(head["mesh"]["vertices"])))
         return {"FINISHED"}
@@ -798,8 +922,9 @@ def apply_clip_data(arm, clip, name=None, follow=True, keyframe=True):
                                scale=STATE.get("scale"),
                                action_name=name or ("HS2_" + clip.name))
     scn = bpy.context.scene
+    last = max(0, int(round(act.frame_range[1])))
     scn.frame_start = 0
-    scn.frame_end = max(1, info["frames"])
+    scn.frame_end = max(1, last)
     try:
         scn.render.fps = int(round(info["fps"]))
     except Exception:
@@ -808,7 +933,7 @@ def apply_clip_data(arm, clip, name=None, follow=True, keyframe=True):
 
     keyed = 0
     if follow and keyframe and rig.has_rig(arm):
-        keyed = rig.key_targets(arm, 1, info["frames"])
+        keyed = rig.key_targets(arm, scn.frame_start, last)
         scn.frame_set(1)
 
     STATE["action"] = act
@@ -829,14 +954,15 @@ def _apply_clip(context, arm, name, fps, follow=True):
     act, info = anim.apply_clip(arm, skel, names, clip, scale=STATE.get("scale"))
 
     scn = context.scene
+    last = max(0, int(round(act.frame_range[1])))
     scn.frame_start = 0
-    scn.frame_end = max(1, info["frames"])
+    scn.frame_end = max(1, last)
     scn.render.fps = int(round(info["fps"]))
     scn.frame_set(1)
 
     keyed = 0
     if follow and rig.has_rig(arm):
-        keyed = rig.key_targets(arm, 1, info["frames"])
+        keyed = rig.key_targets(arm, scn.frame_start, last)
         scn.frame_set(1)
 
     STATE["action"] = act
@@ -930,12 +1056,13 @@ def _after_import(context, arm, act, frames, follow):
     还原 VMD 数据，脚在哪儿就是哪儿。）
     """
     scn = context.scene
+    last = max(0, int(round(act.frame_range[1])))
     scn.frame_start = 0
-    scn.frame_end = max(1, frames)
+    scn.frame_end = max(1, last)
     scn.frame_set(0)
     keyed = 0
     if follow and rig.has_rig(arm):
-        keyed = rig.key_targets(arm, 1, frames)
+        keyed = rig.key_targets(arm, scn.frame_start, last)
         scn.frame_set(1)
     STATE["action"] = act
     return keyed
@@ -1477,6 +1604,70 @@ class HS2_OT_export_fbx(bpy.types.Operator, ExportHelper):
         return {"FINISHED"}
 
 
+def _safe_filename(name, fallback="anim"):
+    s = "".join(c if c not in '<>:"/\\|?*' else "_" for c in (name or ""))
+    return (s.strip(" .") or fallback)[:80]
+
+
+class HS2_OT_export_char_anim(bpy.types.Operator, ExportHelper):
+    """把当前角色身上这条动作导出成只带动画的 FBX（不含身体/头部网格）"""
+    bl_idname = "hs2.export_char_anim"
+    bl_label = "导出当前角色动画"
+    filename_ext = ".fbx"
+    filter_glob: StringProperty(default="*.fbx", options={"HIDDEN"})
+
+    name: StringProperty(name="角色", default="",
+                         description="要导出的角色对象名；留空则用当前角色")
+    deform_only: BoolProperty(name="只导出变形骨", default=True,
+                              description="跟导出骨架时保持一致，避免 UE 里多出控制器骨")
+    all_bones: BoolProperty(name="所有骨都打帧", default=True,
+                            description="开着头骨/表情骨也不会缺曲线；关掉文件更小")
+
+    def _arm(self):
+        ob = bpy.data.objects.get(self.name) if self.name else None
+        if ob is not None and ob.type == "ARMATURE":
+            return ob
+        return current_arm()
+
+    def invoke(self, context, event):
+        arm = self._arm()
+        if arm is not None and not self.filepath:
+            act = arm.animation_data.action if arm.animation_data else None
+            stem = _safe_filename(act.name if act else arm.name + "_anim")
+            base = (os.path.dirname(bpy.data.filepath) if bpy.data.filepath
+                    else os.path.expanduser("~"))
+            self.filepath = os.path.join(base, stem + ".fbx")
+        return ExportHelper.invoke(self, context, event)
+
+    def execute(self, context):
+        arm = self._arm()
+        if arm is None:
+            self.report({"ERROR"}, "先在「编辑对象」里选一个角色")
+            return {"CANCELLED"}
+        act = arm.animation_data.action if arm.animation_data else None
+        if act is None:
+            self.report({"ERROR"}, "当前角色没有动作，先装一条动作再导出")
+            return {"CANCELLED"}
+        path = bpy.path.abspath(self.filepath)
+        if not path.lower().endswith(".fbx"):
+            path += ".fbx"
+        rng = object_action_range(arm) or (1, 1)
+        # take 名 = 动作名（去掉文件名非法字符），UE 里导入的动画序列就直接叫这个
+        take = _safe_filename(act.name, "anim")[:60]
+        try:
+            # export_object 会断父级、临时归零物体变换、按动作范围烘焙；
+            # include_mesh=False → 只选骨架本身，身体/头部网格不会进 FBX。
+            export_object(arm, path, axis="ue", include_mesh=False,
+                          deform_only=self.deform_only,
+                          all_bones=self.all_bones, take_name=take)
+        except Exception as e:
+            self.report({"ERROR"}, "导出失败：%s" % e)
+            return {"CANCELLED"}
+        self.report({"INFO"}, "已导出 %s（动作 %s，%d 帧，仅动画）"
+                    % (os.path.basename(path), act.name, rng[1] - rng[0] + 1))
+        return {"FINISHED"}
+
+
 def _export_root_name(obj):
     if obj.type != "ARMATURE" or not obj.data.bones.get("p_cf_anim"):
         return None
@@ -1485,7 +1676,7 @@ def _export_root_name(obj):
 
 @contextlib.contextmanager
 def _export_with_root(obj):
-    """FBX 的骨架根节点用 p_cf_anim，而不是对象名 HS2_Default。"""
+    """FBX 的骨架根节点用 p_cf_anim，而不是对象名 Armature。"""
     root = _export_root_name(obj)
     if not root or obj.name == root:
         yield
@@ -1506,6 +1697,11 @@ def _export_with_root(obj):
 def _export(arm, path, include_mesh=False, deform_only=True, all_bones=False):
     if bpy.context.object is not None and bpy.context.object.mode != "OBJECT":
         bpy.ops.object.mode_set(mode="OBJECT")
+    return _export_selected(arm, path, include_mesh, deform_only, all_bones)
+
+
+def _export_selected(arm, path, include_mesh=False, deform_only=True,
+                     all_bones=False):
     bpy.ops.object.select_all(action="DESELECT")
     arm.select_set(True)
     if include_mesh:
@@ -1564,12 +1760,20 @@ def _has_object_curves(ob):
 
 
 def _export_selection(path, axis="ue", deform_only=False, all_bones=True,
-                      frame_range=None):
+                      frame_range=None, take_name=None):
     fwd, up = AXIS_PRESETS.get(axis, AXIS_PRESETS["ue"])
     scn = bpy.context.scene
     old_range = (scn.frame_start, scn.frame_end)
+    old_name = scn.name
     if frame_range:
         scn.frame_start, scn.frame_end = int(frame_range[0]), int(frame_range[1])
+    # Blender 的 FBX 导出在用「当前动作」烘焙时，take 名取的是场景名。
+    # 临时把场景改成动作名，UE 里导入出来的动画序列才不是一堆 "Scene"。
+    if take_name:
+        try:
+            scn.name = take_name
+        except Exception:
+            pass
     try:
         with contextlib.ExitStack() as stack:
             for ob in bpy.context.selected_objects:
@@ -1592,6 +1796,11 @@ def _export_selection(path, axis="ue", deform_only=False, all_bones=True,
             )
     finally:
         scn.frame_start, scn.frame_end = old_range
+        if take_name and scn.name != old_name:
+            try:
+                scn.name = old_name
+            except Exception:
+                pass
     return path
 
 
@@ -1607,7 +1816,7 @@ def object_action_range(ob):
 
 
 def export_object(obj, path, axis="ue", include_mesh=True,
-                  deform_only=False, all_bones=True):
+                  deform_only=False, all_bones=True, take_name=None):
     """把**一个**物体（连同它的蒙皮网格）导出成独立的 FBX。
 
     要点（给 UE 用）：
@@ -1653,7 +1862,8 @@ def export_object(obj, path, axis="ue", include_mesh=True,
         for ch, _w, _p in meshes:
             ch.select_set(True)
         _export_selection(path, axis=axis, deform_only=deform_only,
-                          all_bones=all_bones, frame_range=rng)
+                          all_bones=all_bones, frame_range=rng,
+                          take_name=take_name)
     finally:
         # 还原父子关系和变换
         obj.parent = saved["parent"]
@@ -1795,6 +2005,7 @@ CLASSES = (
     HS2_OT_key_targets,
     HS2_OT_bake_fk,
     HS2_OT_export_fbx,
+    HS2_OT_export_char_anim,
     HS2_OT_batch_export,
 )
 

@@ -10,10 +10,10 @@ import sys
 bl_info = {
     "name": "HS2 Anim Kit",
     "author": "HS2AnimKit",
-    "version": (4, 1, 2),
+    "version": (4, 5, 4),
     "blender": (3, 6, 0),
     "location": "3D View > 侧栏 > HS2",
-    "description": "读取 HS2 角色、Studio 动作、H 动作与 H 道具，带 IK 控制层，"
+    "description": "读取 HS2 角色、衣服、Studio 动作、H 动作与 H 道具，带 IK 控制层，"
                    "可镜像/变速/贴地/重定向，按物体导出 UE 用的 FBX",
     "category": "Animation",
 }

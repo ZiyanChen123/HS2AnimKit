@@ -9,6 +9,7 @@ import pickle
 import time
 
 from . import catalog as _catalog
+from . import clothes as _clothes
 from . import clips as _clips
 from . import hashes as _hashes
 from . import head as _head
@@ -16,12 +17,49 @@ from . import hdb as _hdb
 from . import mesh as _mesh
 from . import skeleton as _skel
 from . import unityfs as _unityfs
+from .. import jpcn as _jpcn
 
 __all__ = ["GameAssets", "ClipData", "open_bundle"]
 
 open_bundle = _unityfs.Bundle
 
 CACHE_VERSION = 4
+CLOTHES_CACHE_VERSION = 1
+
+
+def _bind_translation(data, skel):
+    """网格 bindpose 与骨架静止姿态之间的纯平移差。
+
+    ``cm_o_dan00`` 的 bindpose 比 ``p_cf_anim`` 的静止骨架高 0.2724（Unity
+    单位），直接按骨架建网格会让阴茎整体偏高、和睾丸对不上。这里只处理
+    纯平移；有旋转/缩放的网格不猜。
+    """
+    from . import mathutil as mu
+    bp = data.get("bindpose") or []
+    bones = data.get("bones") or []
+    if not bp or not bones:
+        return None
+    offset = None
+    for i, path in enumerate(bones):
+        if i >= len(bp):
+            return None
+        idx = skel.index_of(path)
+        if idx is None:
+            return None
+        flat = bp[i]
+        mat = [[flat[r * 4 + c] for c in range(4)] for r in range(4)]
+        cur = mu.mat_mul(_skel.world_matrix(skel, idx), mat)
+        for r in range(3):
+            for c in range(3):
+                want = 1.0 if r == c else 0.0
+                if abs(cur[r][c] - want) > 1e-3:
+                    return None
+        trans = (cur[0][3], cur[1][3], cur[2][3])
+        if offset is None:
+            offset = trans
+        elif max(abs(trans[k] - offset[k]) for k in range(3)) > 1e-4:
+            return None
+    return offset
 
 
 class GameAssets(object):
@@ -36,6 +74,8 @@ class GameAssets(object):
         self._index = None
         self._head = None
         self._catalog = None
+        self._clothes = None
+        self._genital = None
         self._memo = {}
 
     # ---------------- 磁盘缓存 ----------------
@@ -248,11 +288,15 @@ class GameAssets(object):
                     cat = json.load(f)
                 if (cat.get("game_dir") == self.game_dir
                         and cat.get("version") == _catalog.CACHE_VERSION
-                        and (cat.get("h") or not with_h)):
+                        and (cat.get("h") or not with_h
+                             or cat.get("h_scanned"))):
+                    # 旧缓存没有中文名字段，载入时就地补齐，不用重扫
+                    _jpcn.localize_modes((cat.get("h") or {}).get("modes"))
                     self._catalog = cat
                     return cat
-            except Exception:
-                pass
+            except Exception as e:
+                # 别把异常吞掉：这里出错会导致每次启动都重扫几十秒
+                print("[HS2] 目录缓存读取失败，将重建：%s" % e)
 
         skel_paths = None
         try:
@@ -263,28 +307,171 @@ class GameAssets(object):
                              with_h=with_h, skeleton_paths=skel_paths)
         cat["game_dir"] = self.game_dir
         cat["version"] = _catalog.CACHE_VERSION
-        try:
-            os.makedirs(self.cache_dir, exist_ok=True)
-            tmp = p + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(cat, f, ensure_ascii=False)
-            os.replace(tmp, p)
-            # 清掉旧版本的目录缓存（改格式会换文件名，不清就攒一堆）
-            import glob
-            keep = os.path.basename(p)
-            for old in glob.glob(os.path.join(self.cache_dir, "catalog_v*.json")):
-                if os.path.basename(old) != keep:
-                    try:
-                        os.remove(old)
-                    except OSError:
-                        pass
-        except Exception:
-            pass
+        cat["h_scanned"] = bool(with_h)
+        # 空目录结果不写缓存：扫描失败（比如 python 版本不对）时不能拿空表
+        # 把上一次的好缓存盖掉，否则用户会莫名少掉整个动作库。
+        if not cat.get("studio"):
+            print("[HS2] 目录扫描没读到 Studio 动作，这次不写缓存")
+        else:
+            try:
+                os.makedirs(self.cache_dir, exist_ok=True)
+                tmp = p + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(cat, f, ensure_ascii=False)
+                os.replace(tmp, p)
+                # 清掉旧版本的目录缓存（改格式会换文件名，不清就攒一堆）
+                import glob
+                keep = os.path.basename(p)
+                for old in glob.glob(os.path.join(self.cache_dir, "catalog_v*.json")):
+                    if os.path.basename(old) != keep:
+                        try:
+                            os.remove(old)
+                        except OSError:
+                            pass
+            except Exception as e:
+                print("[HS2] 目录缓存写入失败：%s" % e)
         self._catalog = cat
         return cat
 
     def h_data(self, rebuild=False, progress=None):
         return self.catalog(rebuild=rebuild, progress=progress).get("h") or {}
+
+    # ---------------- 男性生殖器（H 场景用） ----------------
+
+    def male_genital(self):
+        """oo_base 里的 cm_o_dan00 / cm_o_dan_f（带骨骼下标）。
+
+        同名网格在 prefab 里有 female silhouette / male silhouette / 身体本体
+        几份拷贝，骨骼路径虽然一样，但 SMR root/bind 不同。优先取
+        ``p_cm_body_00`` 身体本体下、不在 silhouette 里的那一份。
+        """
+        if self._genital is not None:
+            return self._genital
+        self.check()
+        b = self.base
+        skel = self.skeleton()
+        out = []
+        for mesh_name in ("cm_o_dan00", "cm_o_dan_f"):
+            best = None
+            best_score = -999
+            for smr in b.smrs():
+                tt = b.typetree(smr)
+                mid = tt.get("m_Mesh", {}).get("m_PathID")
+                if mid not in b.objects:
+                    continue
+                try:
+                    if b.typetree(mid).get("m_Name") != mesh_name:
+                        continue
+                except Exception:
+                    continue
+                go = tt.get("m_GameObject", {}).get("m_PathID")
+                nt = b.go2node.get(go)
+                path = b.path_of(nt) if nt else ""
+                score = 0
+                if path.startswith("n_o_root/n_body_base/N_mnpbset/N_dan/"):
+                    score += 100
+                if "o_silhouette_" in path:
+                    score -= 50
+                if "/N_dan/" in path and "silhouette" not in path:
+                    score += 10
+                if nt is not None:
+                    n = b.nodes[nt]
+                    # 身体本体那份一般没有额外偏移
+                    if abs(n.pos[0]) + abs(n.pos[1]) + abs(n.pos[2]) < 0.01:
+                        score += 5
+                if score > best_score:
+                    best_score = score
+                    best = smr
+            if best is None:
+                print("[HS2] 找不到男性生殖器网格 %s" % mesh_name)
+                continue
+            try:
+                tt = b.typetree(best)
+                paths = []
+                for ptr in tt.get("m_Bones") or []:
+                    tid = ptr.get("m_PathID")
+                    paths.append(b.path_of(tid) if tid in b.nodes else "")
+                mid = tt["m_Mesh"]["m_PathID"]
+                data = _mesh.extract_by_pid(b, mid, mesh_name, paths)
+                off = _bind_translation(data, skel)
+                if off:
+                    data["vertices"] = [
+                        (v[0] + off[0], v[1] + off[1], v[2] + off[2])
+                        for v in data["vertices"]
+                    ]
+                data["bone_index"] = [
+                    skel.index_of(p) if skel.index_of(p) is not None else -1
+                    for p in paths
+                ]
+                mats = []
+                for mp in tt.get("m_Materials") or []:
+                    pid = mp.get("m_PathID")
+                    if pid in b.objects:
+                        mats.append(b.typetree(pid).get("m_Name", ""))
+                out.append({"name": mesh_name, "mesh": data,
+                            "materials": mats})
+            except Exception as e:
+                print("[HS2] 男性生殖器网格 %s 读取失败：%s" % (mesh_name, e))
+        self._genital = out
+        return out
+
+    # ---------------- 衣服目录 ----------------
+
+    def clothes_catalog_path(self):
+        return os.path.join(
+            self.cache_dir, "clothes_v%d.json" % CLOTHES_CACHE_VERSION)
+
+    def _clothes_stamp(self):
+        """characustom 目录的文件数 + 最新修改时间，用来发现新增/更新的 Mod。"""
+        root = os.path.join(self.game_dir, "abdata", "list", "characustom")
+        latest, count = 0.0, 0
+        try:
+            for name in os.listdir(root):
+                if not name.lower().endswith(".unity3d"):
+                    continue
+                count += 1
+                try:
+                    latest = max(latest, os.stat(
+                        os.path.join(root, name)).st_mtime)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+        return "%d:%.0f" % (count, latest)
+
+    def clothes_catalog(self, rebuild=False, progress=None):
+        """扫描 abdata/list/characustom，返回衣服记录（带磁盘缓存）。"""
+        if self._clothes is not None and not rebuild:
+            return self._clothes
+        p = self.clothes_catalog_path()
+        stamp = self._clothes_stamp()
+        if os.path.isfile(p) and not rebuild:
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if (data.get("game_dir") == self.game_dir
+                        and data.get("version") == CLOTHES_CACHE_VERSION
+                        and data.get("stamp") == stamp):
+                    self._clothes = data.get("records") or []
+                    return self._clothes
+            except Exception as e:
+                print("[HS2] 衣服缓存读取失败，将重扫：%s" % e)
+
+        records = _clothes.load_catalog(self.game_dir, progress=progress)
+        if records:
+            try:
+                os.makedirs(self.cache_dir, exist_ok=True)
+                tmp = p + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump({"game_dir": self.game_dir,
+                               "version": CLOTHES_CACHE_VERSION,
+                               "stamp": stamp, "records": records},
+                              f, ensure_ascii=False)
+                os.replace(tmp, p)
+            except Exception as e:
+                print("[HS2] 衣服缓存写入失败：%s" % e)
+        self._clothes = records
+        return records
 
     # ---------------- 按目录条目加载动作 ----------------
 

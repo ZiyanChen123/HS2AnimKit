@@ -83,6 +83,7 @@ def extract_by_pid(bundle, pid, mesh_name=BODY_MESH, mesh_bones=None):
         "weights": weights,
         "bones": list(mesh_bones or []),
         "bindpose": bindpose,
+        "index_format": int(tt.get("m_IndexFormat", 0)),
         "submeshes": [(int(s.get("firstByte", 0)), int(s.get("indexCount", 0)))
                       for s in tt.get("m_SubMeshes", [])],
     }

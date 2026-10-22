@@ -4,6 +4,7 @@
 这样 Agent 直接调函数，也能得到和点按钮完全一样的结果。
 """
 import os
+import time
 
 import bpy
 from bpy.props import (BoolProperty, CollectionProperty, EnumProperty,
@@ -11,7 +12,7 @@ from bpy.props import (BoolProperty, CollectionProperty, EnumProperty,
 
 from .ripper import hdb
 
-from . import animlib, api, ops, props, rig
+from . import animlib, api, jpcn, ops, props, rig
 
 
 def _redraw(context):
@@ -187,7 +188,10 @@ def h_modes(context):
     if filt:
         modes = [m for m in modes
                  if filt in (m.get("label") or "").lower()
+                 or filt in (m.get("label_jp") or "").lower()
+                 or filt in (m.get("label_cn") or "").lower()
                  or filt in (m.get("type_jp") or "").lower()
+                 or filt in (m.get("type_cn") or "").lower()
                  or filt in (m.get("type") or "").lower()
                  or filt in (m.get("cast_text") or "")]
     cast = getattr(context.scene, "hs2_h_cast", "ALL") or "ALL"
@@ -267,7 +271,7 @@ class HS2_OT_load_h(bpy.types.Operator):
                     return {"CANCELLED"}
                 first = list(res["info"])[0]
                 self.report({"INFO"}, "%s · %s（%d 帧）· %d 个角色%s"
-                            % (res["mode"]["label"],
+                            % (jpcn.label_of(res["mode"]),
                                res["stage"]["cn"] if res.get("stage") else "",
                                res["info"][first]["frames"],
                                len(res["actions"]),
@@ -277,7 +281,7 @@ class HS2_OT_load_h(bpy.types.Operator):
                 res = api.apply_h(mode, stage, target=char,
                                   with_props=self.with_props)
                 self.report({"INFO"}, "%s → %s · %s（%d 帧）%s"
-                            % (res["mode"]["label"],
+                            % (jpcn.label_of(res["mode"]),
                                api.SLOT_CN.get(res["slot"], res["slot"]),
                                res["stage"]["cn"], res["info"]["frames"],
                                "，道具 %d" % len(res["props"])
@@ -400,9 +404,9 @@ class HS2_OT_setup_cast(bpy.types.Operator):
         except Exception as e:
             self.report({"ERROR"}, "失败：%s" % e)
             return {"CANCELLED"}
-        scn.hs2_last = "%s · %d 个角色" % (m.get("label"), len(res["actions"]))
+        scn.hs2_last = "%s · %d 个角色" % (jpcn.label_of(m), len(res["actions"]))
         self.report({"INFO"}, "%s：补了 %d 个角色，装了 %d 个"
-                    % (m.get("label"), len(made["added"]),
+                    % (jpcn.label_of(m), len(made["added"]),
                        len(res["actions"])))
         _redraw(context)
         return {"FINISHED"}
@@ -662,10 +666,11 @@ def refresh_h(context):
     # 界面上就是两行一模一样的名字，看着像「列表去重失败」。所以重名的补个编号。
     counts = {}
     for m in modes:
-        counts[m.get("label")] = counts.get(m.get("label"), 0) + 1
+        name = jpcn.label_of(m)
+        counts[name] = counts.get(name, 0) + 1
     rows = []
     for m in modes:
-        label = m.get("label") or m["key"]
+        label = jpcn.label_of(m) or m["key"]
         if counts.get(label, 0) > 1:
             label = "%s  [%s-%s]" % (label, m.get("pack"), m.get("id"))
         # 右侧那列：场景 + 道具件数 + 阵容。以前只有阵容，看不出这一段要带什么。
@@ -731,7 +736,7 @@ def current_stage(context):
 # 在 draw() 里清空并重填 CollectionProperty，Blender 的列表框经常画成空框
 # （它拿到的是上一次的 item 指针）。所以列表一律在定时器/回调里重建，
 # draw 只负责画。
-_TIMER = {"on": False, "scan": False, "tried": False}
+_TIMER = {"on": False, "scan": False, "tried": False, "panel": 0.0}
 
 
 def run_scan():
@@ -812,9 +817,28 @@ def refresh_all(context):
         refresh_h(context)
         refresh_stages(context)
         maybe_autoscan(context)
+    elif tab == "CLOTH":
+        try:
+            from . import clothops
+            clothops.refresh(context)
+        except Exception:
+            pass
+
+
+def note_panel_draw():
+    """HS2 面板真的在画时调用：说明用户在看这个页签，才值得读目录/刷列表。
+
+    Blender 启动时插件会被加载，但用户可能压根不打开 HS2 页签。以前定时器
+    一启动就 refresh，等于每次开机都去读一遍动作库缓存（缓存坏了就重扫
+    几十秒），白白卡启动。现在没画面板就什么都不做。
+    """
+    _TIMER["panel"] = time.time()
 
 
 def _tick():
+    # 3 秒内没画过 HS2 面板 → 认为面板关着，空转即可
+    if time.time() - _TIMER["panel"] > 3.0:
+        return 0.5
     try:
         refresh_all(bpy.context)
     except Exception:
@@ -1098,7 +1122,7 @@ def _load_h_stage(context, stage, mode=None):
     info = (r.get("info") or {})
     frames = info[list(info)[0]]["frames"] if info else 0
     context.scene.hs2_last = "%s · %s%s" % (
-        m.get("label"), stage_cn,
+        jpcn.label_of(m), stage_cn,
         "（沿用当前演员）" if r.get("reused") else
         (" · %d 帧 · %d 人" % (frames, len(api.characters()))))
     _sync_variant(context)
@@ -1214,7 +1238,8 @@ def scene_props():
         # ---- 页签 ----
         "hs2_tab": EnumProperty(
             name="分类", default="STUDIO", update=_on_tab,
-            items=[("STUDIO", "工作室动作", ""), ("H", "H 动作", "")]),
+            items=[("STUDIO", "工作室", ""), ("H", "H 动作", ""),
+                   ("CLOTH", "换装", "")]),
         # ---- 角色 ----
         # ---- 工作室动作 ----
         "hs2_studio_items": CollectionProperty(type=HS2ClipItem),
