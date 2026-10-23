@@ -282,6 +282,76 @@ def fix_rest(arm, bind):
 
 
 # --------------------------------------------------------------------------
+# 1b. 根骨收口：p_cf_anim 必须是根
+# --------------------------------------------------------------------------
+
+ROOT_BONE = "p_cf_anim"
+
+
+def prune_root(arm, root=ROOT_BONE):
+    """把 ``root`` 之上的多余根骨删掉（工作室导出会在外面套一层 BodyTop）。
+
+    只删「没有蒙皮权重」的上层骨：权重骨一律留着，否则蒙皮会缺一块。
+    返回删掉的骨名列表。
+    """
+    target = arm.data.bones.get(root)
+    if target is None:
+        return []
+
+    # 哪些骨有蒙皮权重
+    weighted = set()
+    for ob in bpy.data.objects:
+        if ob.type != "MESH" or ob.parent is not arm:
+            continue
+        for g in ob.vertex_groups:
+            weighted.add(g.name)
+
+    above = []
+    p = target.parent
+    while p is not None:
+        above.append(p.name)
+        p = p.parent
+    if not above:
+        return []
+    for name in above:
+        if name in weighted:
+            return []       # 上层骨在用，不动
+
+    prev_active = bpy.context.view_layer.objects.active
+    try:
+        if bpy.context.object is not None and bpy.context.object.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        for ob in bpy.context.selected_objects:
+            ob.select_set(False)
+        arm.select_set(True)
+        bpy.context.view_layer.objects.active = arm
+        bpy.ops.object.mode_set(mode="EDIT")
+        ebs = arm.data.edit_bones
+        eb = ebs.get(root)
+        if eb is not None:
+            eb.parent = None          # 先断开，位置不会变（edit bone 是绝对坐标）
+        for name in above:
+            b = ebs.get(name)
+            if b is not None:
+                ebs.remove(b)
+        bpy.ops.object.mode_set(mode="OBJECT")
+    finally:
+        try:
+            if bpy.context.object is not None and bpy.context.object.mode != "OBJECT":
+                bpy.ops.object.mode_set(mode="OBJECT")
+        except Exception:
+            pass
+        if prev_active is not None:
+            try:
+                bpy.context.view_layer.objects.active = prev_active
+            except Exception:
+                pass
+    # 清理只剩空壳的顶点组名（删掉的骨如果建过组）
+    print("[HS2] 删掉 p_cf_anim 之上的根骨：%s" % above)
+    return above
+
+
+# --------------------------------------------------------------------------
 # 2. 骨头配对（含 L/R 镜像）
 # --------------------------------------------------------------------------
 
@@ -437,21 +507,33 @@ def apply(arm, skel, clip=None, name=None, scale=0.1, keyframe=None):
 
     locs = {c: [] for c in pos_tracks}
     quats = {c: [] for c in bmap}
+    scales = {c: [] for c in bmap}
     # 游戏动作的位置是「原始单位」（1 = 0.1m）。骨架局部空间用的也是原始
     # 单位（骨头 rest 就是 BindPose 的数值），所以位移直接照搬、只乘身高比。
     # 骨架物体的缩放只决定最终显示多大，不能混进这里 —— 混进来会让
     # 0.1 以外的骨架（比如 Better FBX 的 0.01）根位移差 10 倍。
+    # 缩放：游戏动作会拉伸手肘/膝盖的 dam 补偿骨（cf_J_ArmLow02_dam 实测到
+    # 1.09），丢掉这块关节会塌。这里按「世界缩放 / 静止缩放」照抄。
+    rest_scale = {c: Vector(Matrix(raw_rest[i]).to_scale()) for c, i in bmap.items()}
     prev_q = {}
     world = {}
     pose_q = {}
     pose_d = {}
+    pose_s = {}
 
     for f in range(n):
         # 朝向用 Unity 空间的原始矩阵（FBX 骨空间就是这个）；位移用父空间
         # 的局部增量，跟骨长无关。
         fw = raw_worlds[f] if raw_worlds is not None else raw_rest
         for cname, i in bmap.items():
-            pose_q[cname] = _q(Matrix(fw[i]))
+            mm = Matrix(fw[i])
+            pose_q[cname] = _q(mm)
+            s = mm.to_scale()
+            r0 = rest_scale[cname]
+            pose_s[cname] = Vector((
+                s.x / r0.x if abs(r0.x) > 1e-6 else 1.0,
+                s.y / r0.y if abs(r0.y) > 1e-6 else 1.0,
+                s.z / r0.z if abs(r0.z) > 1e-6 else 1.0))
         for cname, (p, bpos) in pos_tracks.items():
             pose_d[cname] = Vector(((p[f][0] - bpos[0]) * ratio,
                                     (p[f][1] - bpos[1]) * ratio,
@@ -483,12 +565,17 @@ def apply(arm, skel, clip=None, name=None, scale=0.1, keyframe=None):
                 pos = rest[nb].translation.copy()
 
             m = qt.to_matrix().to_4x4()
+            sc = pose_s[nb]
+            try:
+                m = m @ Matrix.Diagonal((sc.x, sc.y, sc.z, 1.0))
+            except Exception:
+                pass
             m.translation = pos
             world[nb] = m
 
             basis = A.inverted() @ ((world[par.name].inverted() if par is not None
                                      else Matrix()) @ m)
-            loc, q, _scl = basis.decompose()
+            loc, q, scl = basis.decompose()
             q.normalize()
             prev = prev_q.get(nb)
             if prev is not None and prev.dot(q) < 0.0:
@@ -497,6 +584,8 @@ def apply(arm, skel, clip=None, name=None, scale=0.1, keyframe=None):
             quats[nb].append((q.w, q.x, q.y, q.z))
             if nb in locs:
                 locs[nb].append((loc.x, loc.y, loc.z))
+            if nb in scales:
+                scales[nb].append((scl.x, scl.y, scl.z))
 
     info = {
         "frames": n,
@@ -527,7 +616,8 @@ def apply(arm, skel, clip=None, name=None, scale=0.1, keyframe=None):
                 pb.location = locs[b.name][0]
             else:
                 pb.location = (0.0, 0.0, 0.0)
-            pb.scale = (1.0, 1.0, 1.0)
+            s = scales.get(b.name)
+            pb.scale = s[0] if s else (1.0, 1.0, 1.0)
         bpy.context.view_layer.update()
         return None, info
 
@@ -556,6 +646,20 @@ def apply(arm, skel, clip=None, name=None, scale=0.1, keyframe=None):
         for c in range(3):
             compat.fill(compat.new_fcurve(bag, base, c, g),
                         [v[c] for v in vals], start=0)
+
+    # 缩放：只有 dam/软组织的骨会变，其余写一个常数帧（避免切动作时残留旧值）
+    for cname, vals in scales.items():
+        if not vals:
+            continue
+        base = 'pose.bones["%s"].scale' % cname
+        g = groups.get(cname)
+        flat = all(abs(v[k] - 1.0) < 2e-3 for v in vals for k in range(3))
+        for c in range(3):
+            if flat:
+                compat.fill(compat.new_fcurve(bag, base, c, g), [1.0], start=0)
+            else:
+                compat.fill(compat.new_fcurve(bag, base, c, g),
+                            [v[c] for v in vals], start=0)
 
     info["fcurves"] = compat.fcurve_count(act, arm)
     return act, info

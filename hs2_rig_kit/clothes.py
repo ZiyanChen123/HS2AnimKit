@@ -12,6 +12,7 @@ import bpy
 
 from . import bdata
 from . import tex
+from . import ueunit
 from .ripper import clothes as rc
 from .ripper import mesh as rmesh
 
@@ -584,19 +585,21 @@ def _export_fbx(arm, objects, path):
     if ad is not None:
         ad.action = None
     with _export_with_root(arm):
-        bpy.ops.export_scene.fbx(
-            filepath=path, use_selection=True,
-            object_types={"ARMATURE", "MESH"},
-            apply_scale_options="FBX_SCALE_ALL", global_scale=1.0,
-            use_mesh_modifiers=True, mesh_smooth_type="FACE",
-            add_leaf_bones=False,
-            use_armature_deform_only=False,
-            primary_bone_axis="Y", secondary_bone_axis="X",
-            armature_nodetype="NULL",
-            axis_forward="-Z", axis_up="Y",
-            bake_anim=False,
-            path_mode="COPY", embed_textures=False,
-        )
+        # 衣服要跟角色的骨架同单位（厘米），否则 UE 里会比人小 100 倍
+        with ueunit.centimeters(arm, objects):
+            bpy.ops.export_scene.fbx(
+                filepath=path, use_selection=True,
+                object_types={"ARMATURE", "MESH"},
+                apply_scale_options="FBX_SCALE_ALL", global_scale=1.0,
+                use_mesh_modifiers=True, mesh_smooth_type="FACE",
+                add_leaf_bones=False,
+                use_armature_deform_only=False,
+                primary_bone_axis="Y", secondary_bone_axis="X",
+                armature_nodetype="NULL",
+                axis_forward="-Z", axis_up="Y",
+                bake_anim=False,
+                path_mode="COPY", embed_textures=False,
+            )
 
 
 def _export_textures(record, data, out_dir, bundle, flip_green=False):

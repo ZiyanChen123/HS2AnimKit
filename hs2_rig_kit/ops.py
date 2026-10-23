@@ -527,6 +527,9 @@ def import_character_fbx(path, game_dir=None, male=None, align=True):
     print("[HS2] FBX 骨架按 BindPose 重建：%d 根，平均移动 %.4f"
           % (fix.get("fixed", 0), fix.get("avg", 0.0)))
 
+    # ---- 1b. 根骨收口：工作室会在外面套一层 BodyTop，删掉，让 p_cf_anim 做根 ----
+    pruned = fbxrig.prune_root(arm)
+
     # 单位保护：正常角色 1.0 ~ 2.2m。超出说明导出器换了单位，
     # 按 1.5m 折算一次，别让角色变成 14m 或 1.4cm。
     try:
@@ -593,6 +596,7 @@ def import_character_fbx(path, game_dir=None, male=None, align=True):
                  "body": body.name if body else "",
                  "head": head.name if head else "",
                  "fixed_bones": fix.get("fixed", 0),
+                 "pruned": pruned,
                  "aligned": aligned,
                  "height_ratio": ratio,
                  "bind_pose": bool(bind)}
@@ -635,6 +639,8 @@ class HS2_OT_import_character_fbx(bpy.types.Operator, ImportHelper):
             return {"CANCELLED"}
         msg = ("已导入 %s：%d 个网格，修骨 %d 根"
                % (arm.name, info["meshes"], info["fixed_bones"]))
+        if info.get("pruned"):
+            msg += "，根骨收口 %s" % "/".join(info["pruned"])
         if info["aligned"]:
             msg += "，对齐 %d 根（身高 %.0f%%）" % (
                 info["aligned"], info["height_ratio"] * 100.0)
@@ -2147,38 +2153,64 @@ def _export_with_root(obj):
         obj.data.name = old_data
 
 
-def _export(arm, path, include_mesh=False, deform_only=True, all_bones=False):
+@contextlib.contextmanager
+def _ue_unit(arm, meshes=(), unit="cm"):
+    """unit="cm"：导出期间把骨架/网格换成厘米（理由见 :mod:`hs2_rig_kit.ueunit`）。
+
+    不换的话，UE 导入时会把「米→厘米」的 100 倍乘到根骨 ``p_cf_anim`` 上，
+    根骨缩放变成 100，做「兼容骨架」重定向时动画就对不上。
+    """
+    if unit != "cm":
+        yield
+        return
+    from . import ueunit
+    with ueunit.centimeters(arm, meshes):
+        yield
+
+
+def _export(arm, path, include_mesh=False, deform_only=True, all_bones=False,
+            unit="cm"):
     if bpy.context.object is not None and bpy.context.object.mode != "OBJECT":
         bpy.ops.object.mode_set(mode="OBJECT")
-    return _export_selected(arm, path, include_mesh, deform_only, all_bones)
+    return _export_selected(arm, path, include_mesh, deform_only, all_bones,
+                            unit=unit)
 
 
 def _export_selected(arm, path, include_mesh=False, deform_only=True,
-                     all_bones=False):
+                     all_bones=False, unit="cm"):
     bpy.ops.object.select_all(action="DESELECT")
     arm.select_set(True)
+    meshes = []
     if include_mesh:
-        for name in (BODY_NAME, HEAD_NAME):
+        # 默认角色叫 HS2_Body/HS2_Head，工作室 FBX 角色带的是 hs2_body/hs2_head
+        names = [arm.get("hs2_body"), arm.get("hs2_head"), BODY_NAME, HEAD_NAME]
+        seen = set()
+        for name in names:
+            if not name or name in seen:
+                continue
+            seen.add(name)
             ob = bpy.data.objects.get(name)
-            if ob is not None:
+            if ob is not None and ob.type == "MESH":
                 ob.select_set(True)
+                meshes.append(ob)
     bpy.context.view_layer.objects.active = arm
     # UE 导出不要把骨架物体改名成 p_cf_anim：物体和根骨同名时，UE 的
     # FBX 导入器可能只保留一个，导致动画里的 p_cf_anim 根运动轨道对不上。
-    bpy.ops.export_scene.fbx(
-        filepath=path, use_selection=True,
-        object_types={"ARMATURE", "MESH"},
-        apply_scale_options="FBX_SCALE_ALL",
-        use_mesh_modifiers=True, mesh_smooth_type="FACE",
-        add_leaf_bones=False,
-        use_armature_deform_only=deform_only,
-        primary_bone_axis="Y", secondary_bone_axis="X",
-        armature_nodetype="NULL",
-        bake_anim=True, bake_anim_use_all_bones=all_bones,
-        bake_anim_use_nla_strips=False, bake_anim_use_all_actions=False,
-        bake_anim_force_startend_keying=True, bake_anim_simplify_factor=0.0,
-        path_mode="COPY", embed_textures=False,
-    )
+    with _ue_unit(arm, meshes, unit):
+        bpy.ops.export_scene.fbx(
+            filepath=path, use_selection=True,
+            object_types={"ARMATURE", "MESH"},
+            apply_scale_options="FBX_SCALE_ALL",
+            use_mesh_modifiers=True, mesh_smooth_type="FACE",
+            add_leaf_bones=False,
+            use_armature_deform_only=deform_only,
+            primary_bone_axis="Y", secondary_bone_axis="X",
+            armature_nodetype="NULL",
+            bake_anim=True, bake_anim_use_all_bones=all_bones,
+            bake_anim_use_nla_strips=False, bake_anim_use_all_actions=False,
+            bake_anim_force_startend_keying=True, bake_anim_simplify_factor=0.0,
+            path_mode="COPY", embed_textures=False,
+        )
     return path
 
 
@@ -2213,8 +2245,12 @@ def _has_object_curves(ob):
 
 
 def _export_selection(path, axis="ue", deform_only=False, all_bones=True,
-                      frame_range=None, take_name=None):
+                      frame_range=None, take_name=None, unit=None):
     fwd, up = AXIS_PRESETS.get(axis, AXIS_PRESETS["ue"])
+    if unit is None:
+        unit = "cm" if axis == "ue" else "m"
+    arms = [ob for ob in bpy.context.selected_objects if ob.type == "ARMATURE"]
+    meshes = [ob for ob in bpy.context.selected_objects if ob.type == "MESH"]
     scn = bpy.context.scene
     old_range = (scn.frame_start, scn.frame_end)
     old_name = scn.name
@@ -2232,6 +2268,12 @@ def _export_selection(path, axis="ue", deform_only=False, all_bones=True,
             for ob in bpy.context.selected_objects:
                 if ob.type == "ARMATURE" and axis != "ue":
                     stack.enter_context(_export_with_root(ob))
+            for k, arm in enumerate(arms):
+                # 网格只跟第一个骨架一起缩放，多骨架时不重复乘
+                stack.enter_context(_ue_unit(arm, meshes if k == 0 else (), unit))
+            if not arms and meshes:
+                # 没有骨架（道具、纯网格）：网格自己也要换成厘米
+                stack.enter_context(_ue_unit(None, meshes, unit))
             bpy.ops.export_scene.fbx(
                 filepath=path, use_selection=True,
                 object_types={"ARMATURE", "MESH"},
@@ -2277,7 +2319,9 @@ def export_object(obj, path, axis="ue", include_mesh=True,
         「物体自己也在动」，导入 UE 就成双份动画；
       * 只有骨骼曲线时把物体变换归零，根节点落在原点、朝向干净；
       * 骨架和动画用同一套骨骼轴向（Y/X），UE 侧导入骨架和动画才对得上；
-      * 1 Blender 米 = 1 FBX 单位，UE 导入默认缩放就是 175 cm 的人、20 cm 的道具。
+      * 导出期间把数据换成厘米（UE 的单位），这样 UE 导入后根骨 p_cf_anim
+        的缩放是 1；不换的话 UE 会把「米→厘米」的 100 倍乘到根骨上，
+        做「兼容骨架」重定向时动画就会错。
     """
     if bpy.context.object is not None and bpy.context.object.mode != "OBJECT":
         bpy.ops.object.mode_set(mode="OBJECT")
@@ -2300,15 +2344,18 @@ def export_object(obj, path, axis="ue", include_mesh=True,
     try:
         bpy.ops.object.select_all(action="DESELECT")
         has_obj_anim = _has_object_curves(obj)
+        # 只清位置和旋转，**保留缩放**：工作室 FBX 角色的骨架是 0.1 缩放、
+        # 骨头在原始单位里，连缩放一起清零会把角色放大 10 倍。
+        keep = saved["world"].to_scale()
+        scale_only = Matrix.Diagonal(keep.to_4d())
         if obj.parent is not None:
             obj.parent = None
             if not has_obj_anim:
-                obj.matrix_basis = Matrix.Identity(4)
-                obj.matrix_world = Matrix.Identity(4)
+                obj.matrix_world = scale_only
             else:
                 obj.matrix_world = saved["world"]
         elif not has_obj_anim:
-            obj.matrix_basis = Matrix.Identity(4)
+            obj.matrix_basis = scale_only
 
         obj.select_set(True)
         bpy.context.view_layer.objects.active = obj
