@@ -194,34 +194,34 @@ def fix_rest(arm, bind):
 
     targets = {}
     for b in arm.data.bones:
-        m = bind.get(_base_name(b.name))
+        # 先按原名找：HS2 的阴道骨本来就叫 cf_J_Vagina_L.001 这种，
+        # 把 .001 当 Blender 的重名后缀去掉会去查一根不存在的骨。
+        m = bind.get(b.name)
+        if m is None:
+            m = bind.get(_base_name(b.name))
         if m is None:
             continue
         targets[b.name] = m
     if not targets:
         return {"fixed": 0, "avg": 0.0, "reason": "BindPose 和骨头名对不上"}
 
-    # 骨长：到最近子骨（用 BindPose 的位置算，这样骨长跟着角色比例走）
+    # 骨长：和 Better FBX 的自动骨朝向一致 —— 非叶子骨取所有子骨 head 的
+    # 平均值，叶子骨沿父骨方向延长一倍（纯显示，不影响形变）。
     length = {}
     for b in arm.data.bones:
         t = targets.get(b.name)
         if t is None:
             continue
         head = t.translation
-        best = None
-        for c in b.children:
-            ct = targets.get(c.name)
-            if ct is None:
-                continue
-            d = (ct.translation - head).length
-            if d > 1e-5 and (best is None or d < best):
-                best = d
-        if best is None:
+        kids = [targets[c.name].translation for c in b.children
+                if c.name in targets]
+        if kids:
+            best = (sum(kids, Vector()) / len(kids) - head).length
+        else:
             par = b.parent
             pt = targets.get(par.name) if par is not None else None
-            if pt is not None:
-                best = (head - pt.translation).length * 0.6
-        if best is None:
+            best = ((head - pt.translation).length if pt is not None else 0.0)
+        if best is None or best < 1e-3:
             best = b.length or 0.05
         length[b.name] = max(best, 0.008)
 
@@ -303,20 +303,22 @@ def bone_map(arm, skel, scale=0.1):
     if not idx:
         return {}
     gw = bdata.world_matrices(skel, scale)
-    arm_mw = arm.matrix_world
+    s = float(scale) or 0.1
     out = {}
     for b in arm.data.bones:
-        n = _base_name(b.name)
+        # 先按原名，其次按去掉 Blender 重名后缀的名字
+        n = b.name if b.name in idx else _base_name(b.name)
         alt = _swap_lr(n)
         i = idx.get(n)
         j = idx.get(alt) if alt != n else None
         if i is None and j is None:
             continue
         if i is not None and j is not None:
-            x = (arm_mw @ b.matrix_local).translation.x
-            d0 = abs(x - gw[i][0][3])
-            d1 = abs(x - gw[j][0][3])
-            if d1 + 0.02 < d0:
+            # 两边都换成原始单位再比（游戏世界矩阵是米，骨架局部就是原始单位）
+            x = b.head_local.x
+            d0 = abs(x - gw[i][0][3] / s)
+            d1 = abs(x - gw[j][0][3] / s)
+            if d1 + 0.2 < d0:
                 i = j
         elif i is None:
             i = j
@@ -324,10 +326,13 @@ def bone_map(arm, skel, scale=0.1):
     return out
 
 
-def _height_ratio(arm, skel, gw, bmap):
+def _height_ratio(arm, skel, gw, bmap, scale=0.1):
     """角色和默认骨架的身高比（用头骨到髋骨的距离算），根位移按它缩放。
 
-    ``gw`` 是游戏骨架的世界矩阵（米），所以角色这边也要用世界坐标比。
+    两边都换算成**原始单位**（FBX/游戏数据的单位，1 = 0.1m）再比：
+    角色骨头在骨架局部空间里就是原始单位，游戏侧的世界矩阵是米，
+    要除以游戏数据自己的 ``scale`` 才是同一把尺子。骨架物体的缩放
+    （0.1 或别的值）只影响世界坐标，不能混进来。
     """
     idx = skeleton_index(skel)
     i_head = idx.get("cf_J_Head")
@@ -340,13 +345,14 @@ def _height_ratio(arm, skel, gw, bmap):
         if b is None:
             continue
         if i == i_head:
-            c_head = (arm.matrix_world @ b.matrix_local).translation
+            c_head = b.head_local
         elif i == i_hips:
-            c_hips = (arm.matrix_world @ b.matrix_local).translation
+            c_hips = b.head_local
     if c_head is None or c_hips is None:
         return 1.0
-    d_char = (c_head - c_hips).length
-    d_game = (gw[i_head].translation - gw[i_hips].translation).length
+    d_char = (c_head - c_hips).length                       # 原始单位
+    s = float(scale) or 0.1
+    d_game = (gw[i_head].translation - gw[i_hips].translation).length / s
     if d_game < 1e-6 or d_char < 1e-6:
         return 1.0
     return d_char / d_game
@@ -402,7 +408,7 @@ def apply(arm, skel, clip=None, name=None, scale=0.1, keyframe=None):
     rest = {b.name: b.matrix_local.copy() for b in arm.data.bones}
 
     gw = [Matrix(m) for m in bdata.world_matrices(skel, scale)]
-    ratio = _height_ratio(arm, skel, gw, bmap)
+    ratio = _height_ratio(arm, skel, gw, bmap, scale)
     raw_rest = _frame_worlds(skel, None, 1, scale, {})[0]
 
     tracks = clip.tracks if clip is not None else {}
@@ -431,8 +437,10 @@ def apply(arm, skel, clip=None, name=None, scale=0.1, keyframe=None):
 
     locs = {c: [] for c in pos_tracks}
     quats = {c: [] for c in bmap}
-    # 游戏数据 1 个单位 = 0.1m；骨架局部空间 1 个单位 = arm.scale 米
-    unit = scale / max(float(arm.scale.x) or scale, 1e-9)
+    # 游戏动作的位置是「原始单位」（1 = 0.1m）。骨架局部空间用的也是原始
+    # 单位（骨头 rest 就是 BindPose 的数值），所以位移直接照搬、只乘身高比。
+    # 骨架物体的缩放只决定最终显示多大，不能混进这里 —— 混进来会让
+    # 0.1 以外的骨架（比如 Better FBX 的 0.01）根位移差 10 倍。
     prev_q = {}
     world = {}
     pose_q = {}
@@ -445,9 +453,9 @@ def apply(arm, skel, clip=None, name=None, scale=0.1, keyframe=None):
         for cname, i in bmap.items():
             pose_q[cname] = _q(Matrix(fw[i]))
         for cname, (p, bpos) in pos_tracks.items():
-            pose_d[cname] = Vector(((p[f][0] - bpos[0]) * unit * ratio,
-                                    (p[f][1] - bpos[1]) * unit * ratio,
-                                    (p[f][2] - bpos[2]) * unit * ratio))
+            pose_d[cname] = Vector(((p[f][0] - bpos[0]) * ratio,
+                                    (p[f][1] - bpos[1]) * ratio,
+                                    (p[f][2] - bpos[2]) * ratio))
 
         for b in order:
             nb = b.name

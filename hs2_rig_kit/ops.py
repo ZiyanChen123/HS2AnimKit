@@ -475,8 +475,11 @@ def import_character_fbx(path, game_dir=None, male=None, align=True):
     from . import fbxrig
 
     before = {o.name for o in bpy.data.objects}
+    # ignore_leaf_bones 必须关掉：HS2 的手指末节（cf_J_Hand_Index03_L 等）、
+    # _s 副骨、眼球/瞳孔骨、vagina 骨都是叶子骨，而且是真正带权重的骨。
+    # 开着它导入器会把这些骨删掉、权重并到别的骨上，蒙皮就少一大块。
     bpy.ops.import_scene.fbx(filepath=path, automatic_bone_orientation=True,
-                             ignore_leaf_bones=True, use_anim=False)
+                             ignore_leaf_bones=False, use_anim=False)
     new = [o for o in bpy.data.objects if o.name not in before]
     arm = next((o for o in new if o.type == "ARMATURE"
                 and o.data.bones.get("cf_J_Root")), None)

@@ -103,6 +103,19 @@ def main():
     med, worst, n = bone_mesh_error(arm, body)
     print("[test] 骨头-蒙皮距离：中位 %.4f m，最差 %.4f m（%d 根）" % (med, worst, n))
 
+    # 骨数必须等于 FBX 里的 LimbNode 数（叶子骨、_s 副骨、手指末节都不能少），
+    # 顶点组必须都能找到同名骨，否则那段蒙皮不会跟着动。
+    from hs2_rig_kit import fbxrig
+    bind = fbxrig.read_bindpose(path)
+    bones = {b.name for b in arm.data.bones}
+    groups = {g.name for g in body.vertex_groups}
+    missing_groups = sorted(groups - bones)
+    print("[test] BindPose 节点 %d，骨架骨数 %d，顶点组 %d" % (
+        len(bind), len(bones), len(groups)))
+    print("[test] 顶点组里找不到骨的: %s" % (missing_groups or "无"))
+    check_ok = not missing_groups and len(bones) >= 280
+    print("[test] 骨骼完整：%s" % ("PASS" if check_ok else "FAIL"))
+
     for side in ("L", "R"):
         pb = arm.pose.bones.get("cf_J_Hand_%s" % side)
         if pb is not None:
