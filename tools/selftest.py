@@ -26,7 +26,7 @@ if HERE not in sys.path:
 from hs2_rig_kit import ops, rig
 
 GAME = os.environ.get("HS2_GAME_DIR", "D:/game/HS2")
-ARM = "HS2_Default"
+ARM = ops.ARM_NAME
 
 WATCH = ["cf_J_Hips", "cf_J_Kosi01", "cf_J_Kosi02",
          "cf_J_Spine01", "cf_J_Spine02", "cf_J_Spine03", "cf_J_Neck", "cf_J_Head",

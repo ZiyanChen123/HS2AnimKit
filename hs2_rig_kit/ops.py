@@ -7,7 +7,7 @@ import time
 import bpy
 from bpy.props import (BoolProperty, EnumProperty, FloatProperty, IntProperty,
                        StringProperty)
-from mathutils import Matrix
+from mathutils import Matrix, Vector
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 
 from . import anim, bdata, compat, handpose, mmdrig, retarget, rig
@@ -187,6 +187,45 @@ def _genital_material():
     return mat
 
 
+def _card_skin_material(color, gloss=None):
+    """角色卡肤色材质；保证身体/头部都有可见材质槽。"""
+    def lin(x):
+        try:
+            x = max(0.0, min(1.0, float(x)))
+        except Exception:
+            return 1.0
+        return x / 12.92 if x <= 0.04045 else ((x + 0.055) / 1.055) ** 2.4
+    c = list(color or [0.95, 0.85, 0.82, 1.0])
+    if len(c) < 3:
+        c = [0.95, 0.85, 0.82, 1.0]
+    rgba = (lin(c[0]), lin(c[1]), lin(c[2]), 1.0)
+    name = "HS2_CardSkin"
+    mat = bpy.data.materials.get(name) or bpy.data.materials.new(name)
+    mat.use_nodes = True
+    bsdf = next((n for n in mat.node_tree.nodes
+                 if n.type == "BSDF_PRINCIPLED"), None)
+    if bsdf is not None:
+        bsdf.inputs["Base Color"].default_value = rgba
+        try:
+            g = float(gloss) if gloss is not None else 0.6
+            g = max(0.05, min(1.0, g))
+            bsdf.inputs["Roughness"].default_value = max(0.25, 1.0 - g)
+        except Exception:
+            bsdf.inputs["Roughness"].default_value = 0.55
+    mat.diffuse_color = rgba
+    return mat
+
+
+def _assign_skin_material(mesh_obj, mat):
+    if mesh_obj is None or getattr(mesh_obj, "data", None) is None:
+        return
+    me = mesh_obj.data
+    me.materials.clear()
+    me.materials.append(mat)
+    for poly in me.polygons:
+        poly.material_index = 0
+
+
 def has_male_genital(arm):
     if arm is None:
         return False
@@ -322,7 +361,8 @@ def _apply_base_gray(obj):
 
 
 def build_default(g, include_head=True, scale=0.1, cleanup=True,
-                  body_mesh_name=None, name=None, gender="female", slot=None):
+                  body_mesh_name=None, name=None, gender="female", slot=None,
+                  head_bundle=None, head_prefab=None):
     """加载默认角色（骨架 + 身体 + 头）。
 
     返回 (arm, names, body, head)；操作符和 :mod:`api` 都走这一个入口。
@@ -338,9 +378,11 @@ def build_default(g, include_head=True, scale=0.1, cleanup=True,
     if include_head:
         try:
             if gender == "male":
-                head = g.head(bundle_name="mo_head_00", prefab="p_cm_head_00")
+                head = g.head(bundle_name=head_bundle or "mo_head_00",
+                              prefab=head_prefab or "p_cm_head_00")
             else:
-                head = g.head()
+                head = g.head(bundle_name=head_bundle or "fo_head_00",
+                              prefab=head_prefab or "p_cf_head_00")
         except Exception as e:
             print("[HS2] 头部没读到：%s" % e)
 
@@ -358,14 +400,36 @@ def build_default(g, include_head=True, scale=0.1, cleanup=True,
         for nm in (body_name, head_name):
             _remove_object(nm)
 
-    extra = None
+    extra = []
+    # 体模额外骨（高面数/带阴道骨等）：body mesh 的 bones 里可能有骨架
+    # 没有的骨，先把它们补进骨架，否则权重会丢。
+    try:
+        known = {b.name for b in skel.bones}
+        seen = set()
+        for i, path in enumerate(data.get("bones") or []):
+            name = str(path).split("/")[-1]
+            if not name or name in known or name in seen:
+                continue
+            par = str(path).split("/")[-2] if "/" in str(path) else None
+            w = data.get("bindpose") or []
+            if i >= len(w):
+                continue
+            try:
+                world = Matrix([w[i][j:j + 4] for j in range(0, 16, 4)])
+            except Exception:
+                continue
+            extra.append({"name": name, "parent": par,
+                          "world": world, "deform": True})
+            seen.add(name)
+    except Exception as e:
+        print("[HS2] 体模额外骨读取失败：%s" % e)
     if head:
-        extra = [{"name": b["name"], "parent": b["parent"],
-                  "world": b["world"], "deform": b["deform"]}
-                 for b in head["bones"]]
+        extra += [{"name": b["name"], "parent": b["parent"],
+                   "world": b["world"], "deform": b["deform"]}
+                  for b in head["bones"]]
 
     arm, names = bdata.build_armature(skel, name=arm_name,
-                                      scale=scale, extra=extra)
+                                      scale=scale, extra=extra or None)
     arm["hs2_game_dir"] = g.game_dir
     arm["hs2_gender"] = gender
     arm["hs2_slot"] = slot or free_slot(gender) or (
@@ -392,6 +456,383 @@ def build_default(g, include_head=True, scale=0.1, cleanup=True,
     arm.select_set(True)
     bpy.context.view_layer.objects.active = arm
     return arm, names, body, head_obj
+
+
+_CLOTHES_CATALOG = {}
+
+
+def import_character_fbx(path, game_dir=None, male=None, align=True):
+    """导入工作室 HS2MeshExporter 导出的角色 FBX。
+
+    做三件事（细节见 :mod:`fbxrig`）：
+
+    1. 按 FBX 里的 BindPose 重建 rest 骨，骨头和蒙皮严格对齐
+    2. 把骨架摆成 p_cf_anim 默认骨架的姿势（T-pose + 直手）
+    3. 标记成插件角色，之后套动作走 :func:`fbxrig.apply`
+
+    返回 ``(arm, info)``。
+    """
+    from . import fbxrig
+
+    before = {o.name for o in bpy.data.objects}
+    bpy.ops.import_scene.fbx(filepath=path, automatic_bone_orientation=True,
+                             ignore_leaf_bones=True, use_anim=False)
+    new = [o for o in bpy.data.objects if o.name not in before]
+    arm = next((o for o in new if o.type == "ARMATURE"
+                and o.data.bones.get("cf_J_Root")), None)
+    if arm is None:
+        arm = next((o for o in new if o.type == "ARMATURE"), None)
+    if arm is None:
+        raise RuntimeError("FBX 里没有骨架")
+
+    # 工作室导出是 1/100，插件角色是 1/10（骨头和网格一起缩放，相对关系不变）
+    try:
+        arm.scale = (0.1, 0.1, 0.1)
+    except Exception:
+        pass
+    bpy.context.view_layer.update()
+
+    meshes = [o for o in new if o.type == "MESH"]
+    for ob in meshes:
+        try:
+            if ob.parent is not arm:
+                mw = ob.matrix_world.copy()
+                ob.parent = arm
+                ob.matrix_world = mw
+        except Exception:
+            pass
+
+    # 清空工作室留下的空物体、相机、灯、Cube
+    for ob in list(new):
+        if ob is arm or ob in meshes:
+            continue
+        try:
+            bpy.data.objects.remove(ob, do_unlink=True)
+        except Exception:
+            pass
+    for ob in list(bpy.data.objects):
+        if (ob.type == "MESH" and ob.name.startswith("Cube")
+                and not ob.vertex_groups):
+            try:
+                bpy.data.objects.remove(ob, do_unlink=True)
+            except Exception:
+                pass
+
+    # ---- 1. 按 BindPose 修 rest ----
+    bind = fbxrig.read_bindpose(path)
+    fix = fbxrig.fix_rest(arm, bind)
+    print("[HS2] FBX 骨架按 BindPose 重建：%d 根，平均移动 %.4f"
+          % (fix.get("fixed", 0), fix.get("avg", 0.0)))
+
+    # 单位保护：正常角色 1.0 ~ 2.2m。超出说明导出器换了单位，
+    # 按 1.5m 折算一次，别让角色变成 14m 或 1.4cm。
+    try:
+        hs = []
+        for ob in meshes:
+            hs += [(ob.matrix_world @ Vector(c)).z for c in ob.bound_box]
+        if hs:
+            h = max(hs) - min(hs)
+            if h > 1e-6 and not (0.9 < h < 2.4):
+                f = 1.5 / h
+                arm.scale = tuple(s * f for s in arm.scale)
+                bpy.context.view_layer.update()
+                print("[HS2] FBX 单位异常（角色高 %.3fm），整体缩放 x%.3f" % (h, f))
+    except Exception as e:
+        print("[HS2] FBX 单位检查跳过：%s" % e)
+
+    body = next((o for o in meshes if "o_body" in o.name.lower()), None)
+    head = next((o for o in meshes if o.name.lower().startswith("o_head")), None)
+
+    if male is None:
+        bname = (body.name.lower() if body is not None else "")
+        male = ("_cm" in bname or bname.endswith("cm"))
+    gender = "male" if male else "female"
+    slot = free_slot(gender) or ("m1" if male else "f1")
+    arm["hs2_custom"] = True
+    arm["hs2_gender"] = gender
+    arm["hs2_slot"] = slot
+    try:
+        arm["hs2_scale"] = float(arm.scale.x)
+    except Exception:
+        arm["hs2_scale"] = 0.1
+    arm["hs2_import_fbx"] = os.path.abspath(path)
+    if game_dir:
+        arm["hs2_game_dir"] = os.path.abspath(game_dir)
+    if body is not None:
+        arm["hs2_body"] = body.name
+    if head is not None:
+        arm["hs2_head"] = head.name
+
+    # ---- 2. 对齐默认骨架姿势 ----
+    aligned = 0
+    ratio = 1.0
+    if align and game_dir:
+        try:
+            skel = get_assets(game_dir).skeleton()
+            _act, ainfo = fbxrig.apply(arm, skel, clip=None, scale=0.1)
+            aligned = ainfo["bones"]
+            ratio = ainfo["height_ratio"]
+        except Exception as e:
+            print("[HS2] 对齐默认骨架失败：%s" % e)
+
+    # FBX 导出后个别骨长度异常，octahedral 显示会像大锥体，看着像错位
+    try:
+        arm.data.display_type = "STICK"
+        arm.show_in_front = True
+    except Exception:
+        pass
+
+    for ob in bpy.context.selected_objects:
+        ob.select_set(False)
+    arm.select_set(True)
+    bpy.context.view_layer.objects.active = arm
+    return arm, {"meshes": len(meshes), "scale": 0.1,
+                 "body": body.name if body else "",
+                 "head": head.name if head else "",
+                 "fixed_bones": fix.get("fixed", 0),
+                 "aligned": aligned,
+                 "height_ratio": ratio,
+                 "bind_pose": bool(bind)}
+
+
+class HS2_OT_import_character_fbx(bpy.types.Operator, ImportHelper):
+    """导入工作室角色 FBX：按 BindPose 修骨架 + 对齐默认骨架姿势"""
+    bl_idname = "hs2.import_character_fbx"
+    bl_label = "导入工作室角色 FBX"
+    bl_options = {"REGISTER", "UNDO"}
+    filename_ext = ".fbx"
+    filter_glob: StringProperty(default="*.fbx", options={"HIDDEN"})
+    male: BoolProperty(name="男角色", default=False)
+    align: BoolProperty(name="对齐默认骨架姿势", default=True,
+                        description="把角色摆成 p_cf_anim 默认姿势"
+                                    "（T-pose、手指伸直）")
+
+    def invoke(self, context, event):
+        if not self.filepath:
+            gd = game_dir_of(context)
+            if gd:
+                self.filepath = os.path.join(gd, "Export", "")
+        return ImportHelper.invoke(self, context, event)
+
+    def draw(self, context):
+        col = self.layout.column()
+        col.prop(self, "male")
+        col.prop(self, "align")
+
+    def execute(self, context):
+        path = bpy.path.abspath(self.filepath)
+        if not os.path.isfile(path):
+            self.report({"ERROR"}, "找不到 FBX：%s" % path)
+            return {"CANCELLED"}
+        try:
+            arm, info = import_character_fbx(path, game_dir_of(context),
+                                             male=self.male, align=self.align)
+        except Exception as e:
+            self.report({"ERROR"}, "FBX 导入失败：%s" % e)
+            return {"CANCELLED"}
+        msg = ("已导入 %s：%d 个网格，修骨 %d 根"
+               % (arm.name, info["meshes"], info["fixed_bones"]))
+        if info["aligned"]:
+            msg += "，对齐 %d 根（身高 %.0f%%）" % (
+                info["aligned"], info["height_ratio"] * 100.0)
+        if not info["bind_pose"]:
+            msg += "（没读到 BindPose，骨架可能对不齐）"
+        self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+
+class HS2_OT_align_fbx_pose(bpy.types.Operator):
+    """把工作室 FBX 角色的骨架摆成默认骨架姿势（T-pose + 直手）"""
+    bl_idname = "hs2.align_fbx_pose"
+    bl_label = "对齐默认骨架姿势"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from . import fbxrig
+        arm = current_arm()
+        if arm is None:
+            self.report({"ERROR"}, "先选一个角色骨架")
+            return {"CANCELLED"}
+        gd = game_dir_from_arm(arm)
+        if not gd:
+            self.report({"ERROR"}, "不知道游戏目录，先在设置里指定")
+            return {"CANCELLED"}
+        try:
+            skel = get_assets(gd).skeleton()
+            _act, info = fbxrig.apply(arm, skel, clip=None, scale=0.1)
+        except Exception as e:
+            self.report({"ERROR"}, "对齐失败：%s" % e)
+            return {"CANCELLED"}
+        self.report({"INFO"}, "已对齐 %d 根骨（身高 %.0f%%）"
+                    % (info["bones"], info["height_ratio"] * 100.0))
+        return {"FINISHED"}
+
+
+def _clothing_catalog(game_dir):
+    key = os.path.abspath(game_dir)
+    if key not in _CLOTHES_CATALOG:
+        from .ripper import clothes as _rc
+        _CLOTHES_CATALOG[key] = _rc.load_catalog(game_dir)
+    return _CLOTHES_CATALOG[key]
+
+
+def load_character_card(path, game_dir):
+    """从 HS2 PNG 角色卡加载身体/头部/衣服。
+
+    骨架仍然用插件的 p_cf_anim（默认手型微弯），不经过 MeshExporter 的
+    T-pose；卡里的 shapeValueBody[0] 连续映射到 cf_N_height，衣服按
+    Coordinate 的 8 个槽位还原。面部/头发数据已经解析并挂在 arm 上，
+    后续可以继续套用。
+    """
+    from . import api
+    from . import card as cardlib
+    from .ripper import clothes as _rc
+    from . import clothes as _clothes
+
+    c = cardlib.load_card(path)
+    # 卡里的 sex 字段在部分卡上不可靠，用目录判断。
+    gender = "male" if os.sep + "male" + os.sep in os.path.abspath(path).lower() else "female"
+    head_id = int(c.get("face", {}).get("headId") or 0)
+    # 头模：优先找 abdata/chara/<id>/fo_head_<id>.unity3d（30/35/38/50
+    # 这些是游戏自带/替换头模）；没有就回退 00。模型仍然用同一副骨架。
+    pre = "mo_head" if gender == "male" else "fo_head"
+    head_bundle = "%s_00" % pre
+    head_prefab = "p_cm_head_00" if gender == "male" else "p_cf_head_00"
+    try:
+        for d in os.listdir(os.path.join(game_dir, "abdata", "chara")):
+            cand = "%s_%02d" % (pre, head_id) if head_id >= 0 else ""
+            p2 = os.path.join(game_dir, "abdata", "chara", d,
+                              cand + ".unity3d")
+            if cand and os.path.isfile(p2):
+                head_bundle = cand
+                head_prefab = ("p_cm_head_%02d" if gender == "male"
+                               else "p_cf_head_%02d") % head_id
+                break
+    except Exception:
+        pass
+    try:
+        arm = api.character(gender=gender, head=True, cleanup=True,
+                            head_bundle=head_bundle, head_prefab=head_prefab)
+    except Exception:
+        arm = api.character(gender=gender, head=True, cleanup=True)
+
+    body = bpy.data.objects.get(arm.get("hs2_body") or BODY_NAME)
+    head = bpy.data.objects.get(arm.get("hs2_head") or HEAD_NAME)
+    mat = _card_skin_material(c.get("skin_color"), c.get("skin_gloss"))
+    _assign_skin_material(body, mat)
+    _assign_skin_material(head, mat)
+
+    # 捏人：完整套用 shapeValueBody/Face（cf_J_*_s 骨骼）。
+    try:
+        from . import shapedata
+        shapedata.apply_card_shape(arm, c, game_dir, male=(gender == "male"))
+    except Exception as e:
+        print("[HS2] 捏人骨骼映射失败：%s" % e)
+
+    # 身高：卡里是连续 0..1，游戏对表是 0.8..1.0；只缩 cf_N_height，
+    # 不逐骨乱缩，避免把骨架压扁。
+    sb = c.get("shape_body") or []
+    if sb:
+        try:
+            v = max(0.0, min(1.0, float(sb[0])))
+            s = 0.8 + 0.2 * v
+            pb = arm.pose.bones.get(api.HEIGHT_BONE)
+            if pb is not None:
+                pb.scale = (s, s, s)
+            arm["hs2_height_scale"] = s
+            arm["hs2_height_letter"] = "S" if v < 0.33 else ("L" if v > 0.66 else "M")
+        except Exception:
+            pass
+
+    # 衣服：Coordinate.parts 的顺序就是游戏的 8 个槽位。
+    slots = ("top", "bottom", "inner_t", "inner_b", "gloves",
+             "panst", "socks", "shoes")
+    worn, skipped = 0, 0
+    try:
+        recs = _clothing_catalog(game_dir)
+    except Exception:
+        recs = []
+    by_key = {}
+    for r in recs:
+        if r.get("gender") != gender:
+            continue
+        try:
+            by_key[(int(r.get("id")), r.get("slot"))] = r
+        except Exception:
+            continue
+    skel = None
+    try:
+        skel = get_assets(game_dir).skeleton()
+    except Exception:
+        pass
+    parts = (c.get("coordinate") or {}).get("parts") or []
+    for i, part in enumerate(parts[:len(slots)]):
+        try:
+            ident = int(part.get("id") or 0)
+            if ident <= 0:
+                continue
+            hide = list(part.get("hideOpt") or [])
+            if hide and hide[0]:
+                continue
+            rec = by_key.get((ident, slots[i]))
+            if rec is None:
+                skipped += 1
+                continue
+            states = _rc.available_states(game_dir, rec)
+            st = "" if "" in states else (states[0] if states else "A")
+            _clothes.wear(game_dir, rec, st, arm, skel)
+            worn += 1
+        except Exception as e:
+            print("[HS2] 卡片衣服 %s 失败：%s" % (i, e))
+            skipped += 1
+
+    # 把卡片数据留在物体上，方便后续补面部/头发/材质。
+    arm["hs2_card"] = os.path.abspath(path)
+    arm["hs2_card_name"] = c.get("name") or ""
+    arm["hs2_card_head_id"] = int(c.get("face", {}).get("headId") or 0)
+    arm["hs2_card_hair_id"] = int((c.get("hair", {}).get("parts") or [{}])[0].get("id") or 0)
+    arm["hs2_card_shape_body"] = ",".join("%.6f" % x for x in (c.get("shape_body") or []))
+    arm["hs2_card_shape_face"] = ",".join("%.6f" % x for x in (c.get("shape_face") or []))
+    return arm, c, {"worn": worn, "skipped": skipped,
+                    "body": body.name if body else "",
+                    "head": head.name if head else ""}
+
+
+class HS2_OT_load_character_card(bpy.types.Operator, ImportHelper):
+    """从游戏 UserData/chara 的 PNG 角色卡直接加载角色（不经过工作室）。"""
+    bl_idname = "hs2.load_character_card"
+    bl_label = "从角色卡加载"
+    bl_options = {"REGISTER", "UNDO"}
+    filename_ext = ".png"
+    filter_glob: StringProperty(default="*.png", options={"HIDDEN"})
+
+    def invoke(self, context, event):
+        if not self.filepath:
+            gd = game_dir_of(context)
+            if gd:
+                base = os.path.join(gd, "UserData", "chara", "female")
+                if os.path.isdir(base):
+                    self.filepath = os.path.join(base, "")
+        return ImportHelper.invoke(self, context, event)
+
+    def execute(self, context):
+        gd = game_dir_of(context)
+        if not gd:
+            self.report({"ERROR"}, "先设置游戏目录")
+            return {"CANCELLED"}
+        path = bpy.path.abspath(self.filepath)
+        if not os.path.isfile(path):
+            self.report({"ERROR"}, "找不到角色卡：%s" % path)
+            return {"CANCELLED"}
+        try:
+            arm, c, st = load_character_card(path, gd)
+        except Exception as e:
+            self.report({"ERROR"}, "角色卡加载失败：%s" % e)
+            return {"CANCELLED"}
+        self.report({"INFO"}, "已加载 %s：身体/头/衣服 %d 件（缺 %d），身高 %.3f"
+                    % (c.get("name") or os.path.basename(path), st["worn"],
+                       st["skipped"], arm.get("hs2_height_scale") or 0.0))
+        return {"FINISHED"}
 
 
 class HS2_OT_load_default(bpy.types.Operator):
@@ -648,7 +1089,7 @@ def resolve_studio_clip(base_or_name, height=None):
     return base
 
 
-def clip_list(context, collapse=True):
+def clip_list(context, collapse=False):
     """当前过滤条件下的动作名列表（排序）。
 
     分类是**两级**的（跟游戏一致）：
@@ -656,7 +1097,8 @@ def clip_list(context, collapse=True):
       * ``hs2_clip_sub``  = 小分類（中間項目）—— 椅子 / 女 片手剣 / グラビア …
 
     分类过滤只看**分组键**，避免 category 子串误匹配导致数量爆炸/列表为空。
-    ``collapse=True`` 时把同一动作的 S/M/L 三条并成一条（列表只显示基础名）。
+    默认**不折叠** S/M/L：每个具体动作名单独列出，搜 `turn_L` 才能搜到；
+    之前折叠会把 `_L` 当成身高变体，左转动作因此被隐藏。
 
     默认把 studio 包内嵌的 H 动作（S_Idle / M_Idle / L_MLoop 这类 H 阶段片段，
     group=="H"）滤掉 —— 它们是 H 动画的阶段切块，当不成独立动作演；只
@@ -693,7 +1135,18 @@ def clip_list(context, collapse=True):
                  if only_h or (idx.get(n) or {}).get("group") != "H"]
     filt = (getattr(scn, "hs2_clip_filter", "") or "").strip().lower() if scn else ""
     if filt:
-        names = [n for n in names if filt in n.lower()]
+        # 同时搜内部动作名和官方表示名（「男 90回転 L」这种），否则
+        # 搜「回転」永远搜不到 mc_m_move_04_L。
+        def _match(n):
+            if filt in n.lower():
+                return True
+            e = idx.get(n) or {}
+            for key in ("name", "name_cn", "official", "label"):
+                v = e.get(key)
+                if isinstance(v, str) and filt in v.lower():
+                    return True
+            return False
+        names = [n for n in names if _match(n)]
     if collapse:
         vmap = clip_variant_base(names, idx)
         return vmap
@@ -918,9 +1371,21 @@ def apply_clip_data(arm, clip, name=None, follow=True, keyframe=True):
         names = _names_for(arm, skel)
         STATE["names"] = names
 
-    act, info = anim.apply_clip(arm, skel, names, clip,
-                               scale=STATE.get("scale"),
-                               action_name=name or ("HS2_" + clip.name))
+    if arm.get("hs2_custom"):
+        # 工作室 FBX 骨架：rest 是它自己的 BindPose，骨长/比例也和默认骨架
+        # 不同，所以按「世界朝向直传」重定向（fbxrig.apply），不能用
+        # apply_clip 的世界矩阵强制对齐。
+        from . import fbxrig
+        act, info = fbxrig.apply(arm, skel, clip,
+                                 name=name or ("HS2_" + clip.name),
+                                 scale=0.1, keyframe=keyframe)
+    else:
+        act, info = anim.apply_clip(arm, skel, names, clip,
+                                    scale=STATE.get("scale"),
+                                    action_name=name or ("HS2_" + clip.name))
+    STATE["keyed"] = 0
+    if act is None:
+        return None, info
     scn = bpy.context.scene
     last = max(0, int(round(act.frame_range[1])))
     scn.frame_start = 0
@@ -939,6 +1404,7 @@ def apply_clip_data(arm, clip, name=None, follow=True, keyframe=True):
     STATE["action"] = act
     STATE["clip"] = clip
     STATE["action_name"] = name
+    STATE["keyed"] = keyed
     return act, info
 
 
@@ -946,28 +1412,12 @@ def _apply_clip(context, arm, name, fps, follow=True):
     """把游戏里的动作装进当前骨架。返回 (action, info, keyed)。"""
     g = get_assets(game_dir_of(context))
     skel = STATE.get("skel") or g.skeleton()
-    names = STATE.get("names") or _names_for(arm, skel)
     STATE["skel"] = skel
-    STATE["names"] = names
+    STATE["names"] = STATE.get("names") or _names_for(arm, skel)
 
     clip = g.load_clip(name, fps=fps)
-    act, info = anim.apply_clip(arm, skel, names, clip, scale=STATE.get("scale"))
-
-    scn = context.scene
-    last = max(0, int(round(act.frame_range[1])))
-    scn.frame_start = 0
-    scn.frame_end = max(1, last)
-    scn.render.fps = int(round(info["fps"]))
-    scn.frame_set(1)
-
-    keyed = 0
-    if follow and rig.has_rig(arm):
-        keyed = rig.key_targets(arm, scn.frame_start, last)
-        scn.frame_set(1)
-
-    STATE["action"] = act
-    STATE["clip"] = clip
-    return act, info, keyed
+    act, info = apply_clip_data(arm, clip, name, follow=follow)
+    return act, info, STATE.get("keyed", 0)
 
 
 class HS2_OT_toggle_jointfix(bpy.types.Operator):
@@ -1710,22 +2160,22 @@ def _export_selected(arm, path, include_mesh=False, deform_only=True,
             if ob is not None:
                 ob.select_set(True)
     bpy.context.view_layer.objects.active = arm
-
-    with _export_with_root(arm):
-        bpy.ops.export_scene.fbx(
-            filepath=path, use_selection=True,
-            object_types={"ARMATURE", "MESH"},
-            apply_scale_options="FBX_SCALE_ALL",
-            use_mesh_modifiers=True, mesh_smooth_type="FACE",
-            add_leaf_bones=False,
-            use_armature_deform_only=deform_only,
-            primary_bone_axis="Y", secondary_bone_axis="X",
-            armature_nodetype="NULL",
-            bake_anim=True, bake_anim_use_all_bones=all_bones,
-            bake_anim_use_nla_strips=False, bake_anim_use_all_actions=False,
-            bake_anim_force_startend_keying=True, bake_anim_simplify_factor=0.0,
-            path_mode="COPY", embed_textures=False,
-        )
+    # UE 导出不要把骨架物体改名成 p_cf_anim：物体和根骨同名时，UE 的
+    # FBX 导入器可能只保留一个，导致动画里的 p_cf_anim 根运动轨道对不上。
+    bpy.ops.export_scene.fbx(
+        filepath=path, use_selection=True,
+        object_types={"ARMATURE", "MESH"},
+        apply_scale_options="FBX_SCALE_ALL",
+        use_mesh_modifiers=True, mesh_smooth_type="FACE",
+        add_leaf_bones=False,
+        use_armature_deform_only=deform_only,
+        primary_bone_axis="Y", secondary_bone_axis="X",
+        armature_nodetype="NULL",
+        bake_anim=True, bake_anim_use_all_bones=all_bones,
+        bake_anim_use_nla_strips=False, bake_anim_use_all_actions=False,
+        bake_anim_force_startend_keying=True, bake_anim_simplify_factor=0.0,
+        path_mode="COPY", embed_textures=False,
+    )
     return path
 
 
@@ -1777,7 +2227,7 @@ def _export_selection(path, axis="ue", deform_only=False, all_bones=True,
     try:
         with contextlib.ExitStack() as stack:
             for ob in bpy.context.selected_objects:
-                if ob.type == "ARMATURE":
+                if ob.type == "ARMATURE" and axis != "ue":
                     stack.enter_context(_export_with_root(ob))
             bpy.ops.export_scene.fbx(
                 filepath=path, use_selection=True,
@@ -1991,6 +2441,9 @@ CLASSES = (
     HS2_OT_apply_hand_pose,
     HS2_OT_import_vmd,
     HS2_OT_import_mixamo,
+    HS2_OT_import_character_fbx,
+    HS2_OT_align_fbx_pose,
+    HS2_OT_load_character_card,
     HS2_OT_load_default,
     HS2_OT_add_head,
     HS2_OT_scan_clips,

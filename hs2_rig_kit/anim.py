@@ -46,7 +46,7 @@ def apply_clip(arm_obj, skel, names, clip, scale=None, action_name=None,
     # Blender 静止矩阵与父级关系
     bl_rest = []
     for nm in names:
-        bn = arm_obj.data.bones.get(nm)
+        bn = arm_obj.data.bones.get(nm) if nm else None
         bl_rest.append(bn.matrix_local.copy() if bn else Matrix())
     rel_rest = []
     for i, b in enumerate(bones):
@@ -116,7 +116,7 @@ def apply_clip(arm_obj, skel, names, clip, scale=None, action_name=None,
     groups = {}
     if hasattr(action, "groups"):
         for i in data:
-            if names[i] not in groups:
+            if names[i] and names[i] not in groups:
                 try:
                     groups[names[i]] = action.groups.new(names[i])
                 except Exception:
@@ -137,6 +137,8 @@ def apply_clip(arm_obj, skel, names, clip, scale=None, action_name=None,
 
     for i in data:
         nm = names[i]
+        if not nm:
+            continue
         g = groups.get(nm)
         pos_t, rot_t, scl_t = data[i]
         base = 'pose.bones["%s"]' % nm
@@ -153,6 +155,8 @@ def apply_clip(arm_obj, skel, names, clip, scale=None, action_name=None,
 
     # 姿态模式设为四元数，避免欧拉跳变
     for i in data:
+        if not names[i]:
+            continue
         pb = arm_obj.pose.bones.get(names[i])
         if pb:
             pb.rotation_mode = "QUATERNION"

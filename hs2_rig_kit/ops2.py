@@ -341,13 +341,11 @@ class HS2_OT_select_char(bpy.types.Operator):
             o.select_set(False)
         ob.select_set(True)
         context.view_layer.objects.active = ob
-        # 切换编辑对象后，把身高/胸围档位、阶段列表这些「跟当前演员走」的状态
-        # 刷新成新选中角色的实际值，而不是沿用上一个演员的。
+        # 切换编辑对象后，把阶段列表这些「跟当前演员走」的状态刷新成
+        # 新选中角色的实际值，而不是沿用上一个演员的。
         try:
             _LIST_KEY.pop("stage", None)
-            _VARIANT_CACHE["key"] = None
             refresh_stages(context)
-            _sync_variant(context)
         except Exception as e:
             print("[HS2] 切换角色刷新失败：%s" % e)
         self.report({"INFO"}, "已选中 %s" % ob.name)
@@ -937,60 +935,6 @@ def _on_studio_index(self, context):
     _load_studio(context, items[i].value)
 
 
-_STUDIO_HEIGHT_FALLBACK = [("NONE", "—", "")]
-_STUDIO_HEIGHT_CACHE = {"key": None, "items": _STUDIO_HEIGHT_FALLBACK}
-
-
-def studio_height_items(self, context):
-    """当前选中工作室动作的身高档位下拉（只有动作带 S/M/L 变体才列）。"""
-    try:
-        items = self.hs2_studio_items
-        i = self.hs2_studio_index
-        if not (0 <= i < len(items)):
-            _STUDIO_HEIGHT_CACHE["key"] = None
-            return _STUDIO_HEIGHT_CACHE["items"]
-        name = items[i].value
-        vmap = ops._studio_variant_map(context)
-        hv = vmap.get(name)
-        if not hv:
-            _STUDIO_HEIGHT_CACHE["key"] = None
-            return _STUDIO_HEIGHT_CACHE["items"]
-        default, avail = hv
-        key = (name, default, tuple(sorted(avail)))
-        if _STUDIO_HEIGHT_CACHE["key"] == key:
-            return _STUDIO_HEIGHT_CACHE["items"]
-        out = []
-        for h in hdb.HEIGHT_ORDER:
-            if h in avail:
-                out.append((h, hdb.HEIGHT_CN.get(h, h), ""))
-        out.sort(key=lambda x: default == x[0] and 0 or 1)  # 默认档排最前
-        _STUDIO_HEIGHT_CACHE["key"] = key
-        _STUDIO_HEIGHT_CACHE["items"] = out
-        return out
-    except Exception:
-        return _STUDIO_HEIGHT_CACHE["items"]
-
-
-def _on_studio_height(self, context):
-    """切工作室动作的身高档：换到对应变体动作，并重载。
-    只重装当前选中的这条动作（不触发列表重建的麻烦）。"""
-    if _BUSY["on"]:
-        return
-    h = getattr(self, "hs2_studio_height", "")
-    if not h or h == "NONE":
-        return
-    items = self.hs2_studio_items
-    i = self.hs2_studio_index
-    if not (0 <= i < len(items)):
-        return
-    _BUSY["on"] = True
-    try:
-        _load_studio(context, items[i].value)
-    finally:
-        _BUSY["on"] = False
-    _redraw(context)
-
-
 def _on_stage_index(self, context):
     if _BUSY["on"]:
         return
@@ -1017,91 +961,17 @@ def _current_group(context):
     return m, stage, g
 
 
-_VARIANT_FALLBACK = [("NONE", "—", "")]
-_VARIANT_CACHE = {"key": None, "items": _VARIANT_FALLBACK}
-
-
-def variant_items(self, context):
-    """当前选中阶段的身高/胸围档位 —— 只有这一段动作真有变体才列出来。"""
-    try:
-        m, _stage, g = _current_group(context)
-        if g is None:
-            return _VARIANT_CACHE["items"]
-        variants = hdb.group_variants(g)
-        if not variants:
-            _VARIANT_CACHE["key"] = None
-            _VARIANT_CACHE["items"] = _VARIANT_FALLBACK
-            return _VARIANT_CACHE["items"]
-        key = (m["key"], g["key"], tuple(l for l, _, _ in variants))
-        if _VARIANT_CACHE["key"] != key:
-            _VARIANT_CACHE["key"] = key
-            _VARIANT_CACHE["items"] = [
-                (l, cn, "") for l, cn, _it in variants]
-        return _VARIANT_CACHE["items"]
-    except Exception:
-        return _VARIANT_CACHE["items"]
-
-
-def _on_variant(self, context):
-    """选身高/胸围档位：只改**当前角色**的档位，别的演员保持自己的。
-
-    同一段 H 动作里男女是各自的身形（有高有矮），不能让一套档位同步到
-    所有人 —— 这里只重装当前选中的角色，并同步缩放它的身高骨骼。
-    """
-    if _BUSY["on"]:
-        return
-    from . import api
-    letter = getattr(self, "hs2_h_variant", "")
-    if not letter or letter == "NONE":
-        return
-    m, stage, g = _current_group(context)
-    if m is None:
-        return
-    kind = g["kind"] if g else "height"
-    _BUSY["on"] = True
-    try:
-        api.apply_variant(m, letter, kind=kind, stage=stage or None)
-        cn = hdb.BUST_CN.get(letter, letter) if kind == "bust" else \
-            hdb.HEIGHT_CN.get(letter, letter)
-        context.scene.hs2_last = "%s · %s" % (
-            "胸围" if kind == "bust" else "身高", cn)
-    except Exception as e:
-        print("[HS2] 档位切换失败：%s" % e)
-    finally:
-        _BUSY["on"] = False
-    _redraw(context)
-
-
 def _load_studio(context, name):
-    """装一条动作 = 换一场景：清掉上一场的演员和道具，再按这条动作放演员。
-
-    列表里现在是折叠后的基础名（cook_01），这里按当前身高档位还原成
-    具体动作（cook_01_M）并加载。
-    """
-    scn = context.scene
-    height = getattr(scn, "hs2_studio_height", "") or ""
-    concrete = ops.resolve_studio_clip(name, height if height not in ("", "NONE") else None)
+    """装一条具体动作 = 换一场景：清掉上一场的演员和道具，再按这条动作放演员。"""
     try:
-        res = api.load_studio_fresh(concrete)
+        res = api.load_studio_fresh(name)
     except Exception as e:
         print("[HS2] 装动作失败 %s：%s" % (name, e))
         context.scene.hs2_last = "装不上：%s" % e
         return None
     info = res["info"]
-    # 让身高下拉反映实际加载的档位（默认 M 时把枚举同步成 M）
-    hv = hdb.split_variants(concrete)
-    if hv["height"]:
-        try:
-            avail = [it[0] for it in studio_height_items(scn, context)]
-            if hv["height"] in avail and scn.hs2_studio_height != hv["height"]:
-                scn.hs2_studio_height = hv["height"]
-        except Exception:
-            pass
-    shown = name
-    if concrete != name and hv["height"]:
-        shown = "%s · %s" % (name, hdb.HEIGHT_CN.get(hv["height"], hv["height"]))
     context.scene.hs2_last = "%s · %d 帧 · %s" % (
-        shown, info["frames"], "男" if res["gender"] == "male" else "女")
+        name, info["frames"], "男" if res["gender"] == "male" else "女")
     invalidate_lists()
     _redraw(context)
     return res["action"]
@@ -1125,30 +995,10 @@ def _load_h_stage(context, stage, mode=None):
         jpcn.label_of(m), stage_cn,
         "（沿用当前演员）" if r.get("reused") else
         (" · %d 帧 · %d 人" % (frames, len(api.characters()))))
-    _sync_variant(context)
     invalidate_lists()
     _redraw(context)
     return r
 
-
-def _sync_variant(context):
-    """把「体型档位」枚举同步到当前角色的档位（切阶段后 items 会变）。"""
-    from . import api
-    scn = context.scene
-    char = api.active_character()
-    letter = char.get("hs2_h_letter") if char else ""
-    try:
-        available = [l for l, _c, _d in variant_items(scn, context)]
-    except Exception:
-        available = []
-    if letter and letter in available and scn.hs2_h_variant != letter:
-        _BUSY["on"] = True
-        try:
-            scn.hs2_h_variant = letter
-        except Exception:
-            pass
-        finally:
-            _BUSY["on"] = False
 
 
 # --------------------------------------------------------------------------
@@ -1253,10 +1103,6 @@ def scene_props():
         "hs2_clip_sub": EnumProperty(name="小类", items=subcategory_items,
                                      update=_on_clip_filter,
                                      description="按游戏的「中間項目」过滤"),
-        "hs2_studio_height": EnumProperty(
-            name="身高", default=0, items=studio_height_items,
-            update=_on_studio_height,
-            description="工作室动作的身高档位（cook_01_S/M/L 这类变体）"),
         # ---- H 动作 ----
         "hs2_h_items": CollectionProperty(type=HS2ClipItem),
         "hs2_h_index": IntProperty(name="H 动作", default=-1,
@@ -1272,10 +1118,6 @@ def scene_props():
         "hs2_stage_index": IntProperty(name="阶段", default=0,
                                        update=_on_stage_index),
         "hs2_h_props": BoolProperty(name="带道具", default=True),
-        # ---- 体型档位（只有当前阶段真有身高/胸围变体才显示，items 动态生成）----
-        "hs2_h_variant": EnumProperty(
-            name="体型", default=0, items=variant_items, update=_on_variant,
-            description="当前阶段的身高/胸围档位，切档会重装动画并按档位缩放身高骨骼"),
         # ---- 通用 ----
         "hs2_last": StringProperty(name="状态", default=""),
         "hs2_fingers": BoolProperty(

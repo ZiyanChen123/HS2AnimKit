@@ -180,8 +180,14 @@ class GameAssets(object):
         if not idxs:
             raise KeyError("骨架里没有 cf_J_Head")
         attach = _skel.world_matrix(skel, idxs[0])
-        head_path = os.path.join(self.game_dir, "abdata", "chara", "00",
-                                 bundle_name + ".unity3d")
+        suffix = bundle_name.rsplit("_", 1)[-1]
+        cands = [
+            os.path.join(self.game_dir, "abdata", "chara", "00",
+                         bundle_name + ".unity3d"),
+            os.path.join(self.game_dir, "abdata", "chara", suffix,
+                         bundle_name + ".unity3d"),
+        ]
+        head_path = next((p for p in cands if os.path.isfile(p)), cands[0])
 
         def build():
             return _head.load(self.game_dir, attach, base_bundle=self.base,

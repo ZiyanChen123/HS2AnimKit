@@ -65,7 +65,7 @@ def h_data(rebuild=False):
 # --------------------------------------------------------------------------
 
 def character(gender="female", head=True, generic=False, cleanup=True,
-              slot=None, name=None):
+              slot=None, name=None, head_bundle=None, head_prefab=None):
     """加载角色。gender: female / male。
 
     每个角色会记下自己的**槽位**（女1/女2/男1/男2）和性别，H 动作按槽位装，
@@ -88,11 +88,12 @@ def character(gender="female", head=True, generic=False, cleanup=True,
         arm_obj, names, body, head_obj = ops.build_default(
             g, include_head=head, cleanup=False,
             body_mesh_name="o_body_cm", name=obj_name, gender="male",
-            slot=want)
+            slot=want, head_bundle=head_bundle, head_prefab=head_prefab)
     else:
         arm_obj, names, body, head_obj = ops.build_default(
             g, include_head=head, cleanup=cleanup, name=obj_name,
-            gender=gender, slot=want)
+            gender=gender, slot=want, head_bundle=head_bundle,
+            head_prefab=head_prefab)
     arm_obj["hs2_gender"] = gender
     arm_obj["hs2_slot"] = want
     return arm_obj
@@ -1000,23 +1001,39 @@ def studio_gender(name):
 
 
 def load_studio_fresh(name, fps=None):
-    """装一条工作室动作：先清场，再按这条动作的性别放一个演员。
+    """装一条工作室动作：优先保留从角色卡加载的演员。
 
     ``name`` 可能是带 S/M/L 后缀的身高变体（cook_01_L），装完按变体调整
     角色身高骨架，让身体和该身高的动作对上。
     """
     gender = studio_gender(name)
-    clear_cast()
-    char = character(gender)
-    act, info = load(name, fps=fps)
-    # 身高变体：cook_01_L → 身高档 L，缩骨架身材
-    v = hdb.split_variants(name)
-    if v["height"]:
+    chars = characters()
+    card = next((c for c in chars.values()
+                 if (c.get("hs2_card") or c.get("hs2_custom"))
+                 and gender_of(c) == gender), None)
+    if card is not None:
+        # 卡角色的比例/衣服都是卡里的，不要清场重建；只把动作装到它身上。
+        char = card
         try:
-            set_height_scale(char, v["height"])
+            for ob in bpy.context.selected_objects:
+                ob.select_set(False)
+            char.select_set(True)
+            bpy.context.view_layer.objects.active = char
         except Exception:
             pass
-        char["hs2_height_letter"] = v["height"]
+    else:
+        clear_cast()
+        char = character(gender)
+    act, info = load(name, fps=fps)
+    # 身高变体只对默认角色套；卡角色保留自己的身高。
+    if card is None:
+        v = hdb.split_variants(name)
+        if v["height"]:
+            try:
+                set_height_scale(char, v["height"])
+            except Exception:
+                pass
+            char["hs2_height_letter"] = v["height"]
     return {"action": act, "info": info, "char": char, "gender": gender}
 
 

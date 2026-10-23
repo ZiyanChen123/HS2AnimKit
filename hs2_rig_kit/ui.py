@@ -52,42 +52,6 @@ def _right(layout):
     return r
 
 
-def draw_variant_selector(layout, context):
-    """身高/胸围档位：跟「编辑对象」放一起，只有当前动作真有变体才显示。"""
-    try:
-        from . import ops, ops2
-        from .ripper import hdb
-        scn = context.scene
-        if getattr(scn, "hs2_tab", "STUDIO") == "STUDIO":
-            i = scn.hs2_studio_index
-            items = scn.hs2_studio_items
-            if not (0 <= i < len(items)):
-                return
-            base = items[i].value
-            hv = ops._studio_variant_map(context).get(base)
-            if not hv:
-                return
-            prop = "hs2_studio_height"
-            label = "身高档位"
-            count = len(hv[1])
-        else:
-            _m, _stage, g = ops2._current_group(context)
-            if g is None:
-                return
-            variants = hdb.group_variants(g)
-            if not variants:
-                return
-            prop = "hs2_h_variant"
-            label = "胸围档位" if g.get("kind") == "bust" else "身高档位"
-            count = len(variants)
-        row = layout.row(align=True)
-        row.label(text="%s（%d 档）" % (label, count),
-                  icon="ARMATURE_DATA")
-        row.prop(scn, prop, text="")
-    except Exception:
-        return
-
-
 def draw_actor_buttons(box, context):
     """共享的「编辑对象」按钮；返回 (chars, active)。"""
     from . import api
@@ -118,16 +82,25 @@ def draw_actor_buttons(box, context):
 
 
 def draw_actor_selector(layout, context):
-    """动画页的「编辑对象」：切换演员 + 体型档位 + 导出当前动作。"""
+    """动画页的「编辑对象」：切换演员 + 导出当前动作。"""
     from . import api
+    box = layout.box()
+    row = box.row(align=True)
+    row.scale_y = 1.25
+    row.operator("hs2.import_character_fbx", text="导入工作室 FBX",
+                 icon="FILE_3D")
     chars = api.characters()
     if not chars:
-        box = layout.box()
-        draw_variant_selector(box, context)
         return
     box = layout.box()
     chars, active = draw_actor_buttons(box, context)
-    draw_variant_selector(box, context)
+
+    # 工作室 FBX 角色：骨架姿势可以重新对齐回默认骨架
+    if active is not None and active.get("hs2_custom"):
+        r = box.row(align=True)
+        r.operator("hs2.align_fbx_pose", text="对齐默认骨架姿势",
+                   icon="ARMATURE_DATA")
+        r.label(text="T-pose/直手")
 
     # 只导「当前这个人 + 当前这条动作」，不带网格 —— 给 UE/Unity 用最干净
     if active is not None:
@@ -224,15 +197,24 @@ class HS2_PT_main(bpy.types.Panel):
         if ops2.scanning():
             self.draw_scanning(layout)
             return
-        n = len(scn.hs2_studio_items)
-        if n == 0:
-            self.draw_empty(layout, api)
-            return
 
+        # 搜索框永远先画：关键词搜不到时只显示“没有匹配”，不能让输入框消失。
         row = layout.row(align=True)
         row.prop(scn, "hs2_clip_filter", text="", icon="VIEWZOOM")
         row.prop(scn, "hs2_clip_cat", text="")
         row.prop(scn, "hs2_clip_sub", text="")
+
+        n = len(scn.hs2_studio_items)
+        if n == 0:
+            filt = (getattr(scn, "hs2_clip_filter", "") or "").strip()
+            cat = (getattr(scn, "hs2_clip_cat", "") or "").strip()
+            sub = (getattr(scn, "hs2_clip_sub", "") or "").strip()
+            if filt or (cat and cat not in ("ALL", "～")) or (
+                    sub and sub not in ("ALL", "～")):
+                layout.label(text="没有匹配的动作", icon="INFO")
+            else:
+                self.draw_empty(layout, api)
+            return
 
         layout.template_list("HS2_UL_studio", "", scn, "hs2_studio_items",
                              scn, "hs2_studio_index", rows=13)
@@ -247,14 +229,21 @@ class HS2_PT_main(bpy.types.Panel):
         if ops2.scanning():
             self.draw_scanning(layout)
             return
-        if not len(scn.hs2_h_items):
-            self.draw_empty(layout, api)
-            return
 
+        # H 页的搜索/人数/道具也先画，空结果时保留控件。
         row = layout.row(align=True)
         row.prop(scn, "hs2_h_cast", text="")
         row.prop(scn, "hs2_h_filter", text="", icon="VIEWZOOM")
         row.prop(scn, "hs2_h_props", text="", icon="MESH_DATA")
+
+        if not len(scn.hs2_h_items):
+            filt = (getattr(scn, "hs2_h_filter", "") or "").strip()
+            cast = (getattr(scn, "hs2_h_cast", "ALL") or "ALL")
+            if filt or cast != "ALL":
+                layout.label(text="没有匹配的 H 动作", icon="INFO")
+            else:
+                self.draw_empty(layout, api)
+            return
 
         layout.template_list("HS2_UL_h", "", scn, "hs2_h_items",
                              scn, "hs2_h_index", rows=10)

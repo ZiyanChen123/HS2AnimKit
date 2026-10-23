@@ -8,6 +8,8 @@ _test/
 _cache_test/
 _backup/
 MikuMikuRig-main/
+# 独立发行的换装导出器副本（有自己的发布节奏，不进主仓库）
+hs2_clothes_exporter/
 
 # 发布成品与测试用动作/模型素材
 HS2RigKit_addon.zip
