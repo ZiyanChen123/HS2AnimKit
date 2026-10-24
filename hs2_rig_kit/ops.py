@@ -2051,6 +2051,8 @@ class HS2_OT_export_fbx(bpy.types.Operator, ExportHelper):
     deform_only: BoolProperty(name="只导出变形骨", default=True)
     all_bones: BoolProperty(name="所有骨都打帧", default=False,
                             description="关掉可以显著减小文件；有些引擎要求所有骨都有曲线")
+    bake_anim: BoolProperty(name="带上当前动作", default=True,
+                            description="关掉只导模型（rest 姿势），文件更小、UE 里也不会多一条动画")
 
     def execute(self, context):
         arm = current_arm()
@@ -2058,7 +2060,8 @@ class HS2_OT_export_fbx(bpy.types.Operator, ExportHelper):
             self.report({"ERROR"}, "请先「加载默认角色」")
             return {"CANCELLED"}
         path = _export(arm, bpy.path.abspath(self.filepath),
-                       self.include_mesh, self.deform_only, self.all_bones)
+                       self.include_mesh, self.deform_only, self.all_bones,
+                       bake_anim=self.bake_anim)
         self.report({"INFO"}, "已导出 %s" % path)
         return {"FINISHED"}
 
@@ -2169,15 +2172,15 @@ def _ue_unit(arm, meshes=(), unit="cm"):
 
 
 def _export(arm, path, include_mesh=False, deform_only=True, all_bones=False,
-            unit="cm"):
+            unit="cm", bake_anim=True):
     if bpy.context.object is not None and bpy.context.object.mode != "OBJECT":
         bpy.ops.object.mode_set(mode="OBJECT")
     return _export_selected(arm, path, include_mesh, deform_only, all_bones,
-                            unit=unit)
+                            unit=unit, bake_anim=bake_anim)
 
 
 def _export_selected(arm, path, include_mesh=False, deform_only=True,
-                     all_bones=False, unit="cm"):
+                     all_bones=False, unit="cm", bake_anim=True):
     bpy.ops.object.select_all(action="DESELECT")
     arm.select_set(True)
     meshes = []
@@ -2206,7 +2209,7 @@ def _export_selected(arm, path, include_mesh=False, deform_only=True,
             use_armature_deform_only=deform_only,
             primary_bone_axis="Y", secondary_bone_axis="X",
             armature_nodetype="NULL",
-            bake_anim=True, bake_anim_use_all_bones=all_bones,
+            bake_anim=bake_anim, bake_anim_use_all_bones=all_bones,
             bake_anim_use_nla_strips=False, bake_anim_use_all_actions=False,
             bake_anim_force_startend_keying=True, bake_anim_simplify_factor=0.0,
             path_mode="COPY", embed_textures=False,
@@ -2245,7 +2248,8 @@ def _has_object_curves(ob):
 
 
 def _export_selection(path, axis="ue", deform_only=False, all_bones=True,
-                      frame_range=None, take_name=None, unit=None):
+                      frame_range=None, take_name=None, unit=None,
+                      bake_anim=True):
     fwd, up = AXIS_PRESETS.get(axis, AXIS_PRESETS["ue"])
     if unit is None:
         unit = "cm" if axis == "ue" else "m"
@@ -2284,7 +2288,7 @@ def _export_selection(path, axis="ue", deform_only=False, all_bones=True,
                 primary_bone_axis="Y", secondary_bone_axis="X",
                 armature_nodetype="NULL",
                 axis_forward=fwd, axis_up=up,
-                bake_anim=True, bake_anim_use_all_bones=all_bones,
+                bake_anim=bake_anim, bake_anim_use_all_bones=all_bones,
                 bake_anim_use_nla_strips=False, bake_anim_use_all_actions=False,
                 bake_anim_force_startend_keying=True, bake_anim_simplify_factor=0.0,
                 path_mode="COPY", embed_textures=False,
