@@ -2130,6 +2130,86 @@ class HS2_OT_export_char_anim(bpy.types.Operator, ExportHelper):
         return {"FINISHED"}
 
 
+def skinned_meshes(arm):
+    """这根骨架底下所有蒙皮网格（身体、头、眼睛、衣服…）。"""
+    out = []
+    for ob in bpy.data.objects:
+        if ob.type != "MESH":
+            continue
+        try:
+            if ob.find_armature() is arm:
+                out.append(ob)
+                continue
+        except Exception:
+            pass
+        if ob.parent is arm:
+            out.append(ob)
+    return out
+
+
+class HS2_OT_export_model(bpy.types.Operator, ExportHelper):
+    """把当前角色（骨架 + 全部蒙皮网格）导出成给 UE 用的 FBX
+
+    文件单位写成厘米、骨头数据也是厘米，UE 导入后 p_cf_anim 的缩放是 1
+    （Blender 自带「文件 → 导出 → FBX」会把它变成 100）。
+    """
+    bl_idname = "hs2.export_model"
+    bl_label = "导出模型 FBX"
+    bl_options = {"REGISTER"}
+    filename_ext = ".fbx"
+    filter_glob: StringProperty(default="*.fbx", options={"HIDDEN"})
+
+    name: StringProperty(name="角色", default="",
+                         description="要导出的角色对象名；留空则用当前角色")
+    bake_anim: BoolProperty(name="带上当前动作", default=False,
+                            description="勾上会把当前这条动作一起烘焙；只做模型时别勾")
+    deform_only: BoolProperty(name="只导出变形骨", default=True,
+                              description="关掉会把控制器/辅助骨也带出去")
+    all_bones: BoolProperty(name="所有骨都打帧", default=True,
+                           description="只在带动作时有意义")
+
+    def _arm(self):
+        ob = bpy.data.objects.get(self.name) if self.name else None
+        if ob is not None and ob.type == "ARMATURE":
+            return ob
+        return current_arm()
+
+    def invoke(self, context, event):
+        arm = self._arm()
+        if arm is not None and not self.filepath:
+            stem = _safe_filename(arm.name, "character")
+            base = (os.path.dirname(bpy.data.filepath) if bpy.data.filepath
+                    else os.path.expanduser("~"))
+            self.filepath = os.path.join(base, stem + ".fbx")
+        return ExportHelper.invoke(self, context, event)
+
+    def execute(self, context):
+        arm = self._arm()
+        if arm is None:
+            self.report({"ERROR"}, "场景里没有角色，先加载或导入一个")
+            return {"CANCELLED"}
+        path = bpy.path.abspath(self.filepath)
+        if not path.lower().endswith(".fbx"):
+            path += ".fbx"
+        meshes = skinned_meshes(arm)
+        bpy.ops.object.select_all(action="DESELECT")
+        arm.select_set(True)
+        for ob in meshes:
+            ob.select_set(True)
+        bpy.context.view_layer.objects.active = arm
+        try:
+            _export_selection(path, axis="ue", deform_only=self.deform_only,
+                              all_bones=self.all_bones,
+                              bake_anim=self.bake_anim,
+                              take_name=_safe_filename(arm.name, "character"))
+        except Exception as e:
+            self.report({"ERROR"}, "导出失败：%s" % e)
+            return {"CANCELLED"}
+        self.report({"INFO"}, "已导出 %s（%d 骨 / %d 网格，厘米单位）"
+                    % (os.path.basename(path), len(arm.data.bones), len(meshes)))
+        return {"FINISHED"}
+
+
 def _export_root_name(obj):
     if obj.type != "ARMATURE" or not obj.data.bones.get("p_cf_anim"):
         return None
@@ -2513,6 +2593,7 @@ CLASSES = (
     HS2_OT_bake_fk,
     HS2_OT_export_fbx,
     HS2_OT_export_char_anim,
+    HS2_OT_export_model,
     HS2_OT_batch_export,
 )
 

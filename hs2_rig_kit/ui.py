@@ -8,9 +8,10 @@
 演员的个数和性别由动作决定（工作室动作 1 个，H 单人 1 个、百合 2 女、3P 3 人），
 用户不用知道「女1/女2/男1」这些东西 —— 它们只在内部用来对齐数据。
 
-面板只有三个：
+面板：
     动作   ← 选什么就演什么
     调整   ← IK / 一键处理 / 手势
+    导出   ← 模型 / 模型+动作 / 只动画 / 按物体（单位已处理成厘米）
     外部动作 ← VMD、Mixamo、手动放人（另一种用法，收起）
 """
 
@@ -118,6 +119,13 @@ def draw_actor_selector(layout, context):
         else:
             box.label(text="当前动作：%s · 仅动画" % act.name, icon="ACTION")
 
+        # 连模型一起导（骨架 + 全部网格），给 UE 用
+        row = box.row(align=True)
+        row.scale_y = 1.2
+        op = row.operator("hs2.export_model", text="导出模型（骨架 + 网格）",
+                          icon="FILE_3D")
+        op.name = active.name
+
 
 # --------------------------------------------------------------------------
 # 列表（数据由 ops2 在面板外面维护，draw 只画）
@@ -153,6 +161,63 @@ class HS2_UL_stage(bpy.types.UIList):
 # --------------------------------------------------------------------------
 # 动作（主面板）
 # --------------------------------------------------------------------------
+
+def draw_export_box(layout, context):
+    """导出：模型 / 模型+动作 / 只动画 / 按物体。都在这里，别用文件→导出。"""
+    from . import api
+    arm = api.active_character() or api.arm()
+    has_act = (arm is not None and arm.animation_data is not None
+               and arm.animation_data.action is not None)
+
+    col = layout.column(align=True)
+    col.scale_y = 1.3
+    row = col.row(align=True)
+    row.enabled = arm is not None
+    op = row.operator("hs2.export_model", text="导出模型（骨架 + 网格）",
+                      icon="FILE_3D")
+    if arm is not None:
+        op.name = arm.name
+
+    row = col.row(align=True)
+    row.enabled = arm is not None
+    op = row.operator("hs2.export_model", text="导出模型 + 当前动作",
+                      icon="EXPORT")
+    if arm is not None:
+        op.name = arm.name
+    op.bake_anim = True
+
+    row = col.row(align=True)
+    row.enabled = has_act
+    op = row.operator("hs2.export_char_anim", text="只导当前动作（不含网格）",
+                      icon="ACTION")
+    if arm is not None:
+        op.name = arm.name
+
+    row = col.row(align=True)
+    row.operator("hs2.export_object", text="按物体导出（道具/衣服）…",
+                 icon="OBJECT_DATA")
+
+    box = layout.box()
+    box.label(text="单位已经处理成厘米，UE 导入后 p_cf_anim 缩放 = 1", icon="INFO")
+    box.label(text="别用 文件 → 导出 → FBX：根骨会变成 100", icon="ERROR")
+
+
+class HS2_PT_export(bpy.types.Panel):
+    bl_label = "导出"
+    bl_idname = "HS2_PT_export"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "HS2"
+    bl_parent_id = "HS2_PT_main"
+
+    @classmethod
+    def poll(cls, context):
+        return getattr(context.scene, "hs2_tab", "STUDIO") != "CLOTH"
+
+    @_safe
+    def draw(self, context):
+        draw_export_box(self.layout, context)
+
 
 class HS2_PT_main(bpy.types.Panel):
     bl_label = "动作"
@@ -452,7 +517,7 @@ class HS2_PT_ext(bpy.types.Panel):
                 op.name = ch.name
 
 
-CLASSES = (HS2_PT_main, HS2_PT_edit, HS2_PT_ext,
+CLASSES = (HS2_PT_main, HS2_PT_edit, HS2_PT_export, HS2_PT_ext,
            HS2_UL_studio, HS2_UL_h, HS2_UL_stage)
 
 
